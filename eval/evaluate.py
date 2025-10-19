@@ -34,7 +34,6 @@ def segment_metrics(pred_list, gt_list, num_cls = 2):
         global_accuracy_cur.append(cal_global_acc(pred_img, gt_img))
         statistics.append(get_statistics_seg(pred_img, gt_img, num_cls))
 
-
     global_acc = np.sum([v[0] for v in global_accuracy_cur]) / np.sum([v[1] for v in global_accuracy_cur])
     counts = []
     for i in range(num_cls):
@@ -65,7 +64,6 @@ def prf_metrics(pred_list, gt_list):
     r_acc = tp / (tp + fn)
     f_acc = 2 * p_acc * r_acc / (p_acc + r_acc)
     return p_acc,r_acc,f_acc
-
 
 def cal_prf_metrics(pred_list, gt_list, thresh_step=0.01):
     final_accuracy_all = []
@@ -206,7 +204,6 @@ def get_image_pairs(data_dir, suffix_gt='real_B', suffix_pred='fake_B'):
     return pred_imgs, gt_imgs, pred_imgs_names, gt_imgs_names
 
 def eval(log_eval, results_dir, epoch):
-
     suffix_gt = "lab"
     suffix_pred = "pre"
     log_eval.info(results_dir)

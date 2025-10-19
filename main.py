@@ -5,12 +5,11 @@ Email: liuhui@ieee.org
 '''
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import argparse
 import datetime
 import random
 import time
-from pathlib import Path
+
 import numpy as np
 import torch
 import util.misc as utils
@@ -76,15 +75,23 @@ def get_args_parser():
     return parser
 
 def main(args):
-    checkpoints_path = "./checkpoints"
-    cur_time = time.strftime('%Y_%m_%d_%H:%M:%S', time.localtime(time.time()))
+    cur_time = time.strftime('%Y_%m_%d_%H_%M_%S', time.localtime(time.time()))
     dataset_name = (args.dataset_path).split('/')[-1]
-    process_folder_path = os.path.join(checkpoints_path, cur_time + '_Dataset->' + dataset_name)
+    folder_name = cur_time + '_Dataset->' + dataset_name
+    process_folder_path = os.path.join(args.output_dir, folder_name)
     args.phase = 'train'
     if not os.path.exists(process_folder_path):
         os.makedirs(process_folder_path)
     else:
         print("create process folder error!")
+    
+    weights_output_dir = os.path.join(process_folder_path, "weights")
+    if not os.path.exists(weights_output_dir):
+        os.makedirs(weights_output_dir)
+    
+    results_output_dir = os.path.join(process_folder_path, "results")
+    if not os.path.isdir(results_output_dir):
+        os.makedirs(results_output_dir)
 
     log_train = get_logger(process_folder_path, 'train')
     log_test = get_logger(process_folder_path, 'test')
@@ -135,9 +142,6 @@ def main(args):
         lr_scheduler = PolyLR(optimizer, eta_min=args.min_lr, begin=args.start_epoch, end=args.epochs)
     else:
         raise ValueError(f"Unsupported lr_scheduler: {args.lr_scheduler}")
-    output_dir = args.output_dir + '/' + cur_time + '_Dataset->' + dataset_name
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    output_dir = Path(output_dir)
 
     print("Start processing! ")
     log_train.info("Start processing! ")
@@ -150,31 +154,27 @@ def main(args):
         print("training epoch start -> ", epoch)
         train_one_epoch(model, criterion, train_dataLoader, optimizer, epoch, args, log_train)
         lr_scheduler.step()
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-            if (epoch + 1) % 1 == 0:
-                checkpoint_paths.append(output_dir / f'checkpoint{epoch}.pth')
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
-                }, checkpoint_path)
+        # mute the dummy checkpoint file saving procedure
+        # checkpoint_path = os.path.join(weights_output_dir, f'checkpoint{epoch}.pth')
+        # utils.save_on_master({
+        #     'model': model.state_dict(),
+        #     'optimizer': optimizer.state_dict(),
+        #     'lr_scheduler': lr_scheduler.state_dict(),
+        #     'epoch': epoch,
+        #     'args': args,
+        # }, checkpoint_path)
         print("training epoch finish -> ", epoch)
         print("---------------------------------------------------------------------------------------")
 
         print("testing epoch start -> ", epoch)
-        results_path = cur_time + '_Dataset->' + dataset_name
-        save_root = f'./results/{results_path}/results_' + str(epoch)
+        save_root = os.path.join(results_output_dir, "results_%d"%epoch)
+        if not os.path.isdir(save_root):
+            os.makedirs(save_root)
         args.phase = 'test'
         args.batch_size = args.batch_size_test
         test_dl = create_dataset(args)
         pbar = tqdm(total=len(test_dl), desc=f"Initial Loss: Pending")
 
-        if not os.path.isdir(save_root):
-            os.makedirs(save_root)
         with torch.no_grad():
             model.eval()
             for batch_idx, (data) in enumerate(test_dl):
@@ -193,7 +193,7 @@ def main(args):
 
                 # out[out >= 0.5] = 255
                 # out[out < 0.5] = 0
-
+                # the metric calculation relys on the saved images, so we save them all !!!
                 log_test.info('----------------------------------------------------------------------------------------------')
                 log_test.info("loss -> " + str(loss))
                 log_test.info(str(os.path.join(save_root, "{}_lab.png".format(root_name))))
@@ -217,15 +217,14 @@ def main(args):
         if(max_mIoU < metrics['mIoU']):
             max_Metrics = metrics
             max_mIoU = metrics['mIoU']
-            checkpoint_paths = [output_dir / f'checkpoint_best.pth']
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
-                }, checkpoint_path)
+            checkpoint_path = os.path.join(weights_output_dir, "checkpoint_best.pth")
+            utils.save_on_master({
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'epoch': epoch,
+                'args': args,
+            }, checkpoint_path)
             log_train.info("\nupdate and save best model -> " + str(epoch))
             print("\nupdate and save best model -> ", epoch)
 
@@ -245,7 +244,6 @@ def main(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Process time {}'.format(total_time_str))
     log_train.info('Process time {}'.format(total_time_str))
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('SCSEGAMBA FOR CRACK', parents=[get_args_parser()])

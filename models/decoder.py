@@ -19,7 +19,6 @@ class Decoder(nn.Module):
     def forward(self, samples):
         outs_SAVSS = self.backbone(samples)
         out = self.MFS(outs_SAVSS)
-
         return out
 
 class DiceLoss(nn.Module):
@@ -34,7 +33,6 @@ class DiceLoss(nn.Module):
         fn = ((1 - x) * y).sum(self.dims)
         dc = (2 * tp + self.smooth) / (2 * tp + fp + fn + self.smooth)
         dc = dc.mean()
-
         return 1 - dc
 
 class bce_dice(nn.Module):

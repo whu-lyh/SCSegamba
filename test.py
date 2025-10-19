@@ -17,20 +17,21 @@ parser = argparse.ArgumentParser('SCSEGAMBA FOR CRACK', parents=[get_args_parser
 args = parser.parse_args()
 args.phase = 'test'
 args.dataset_path = '../data/TUT'
+args.model_file_path = "./checkpoints/weights/checkpoint_TUT/checkpoint_TUT.pth"
+args.result_save_path = "./results/results_test/"
 
 if __name__ == '__main__':
     args.batch_size = 1
     t_all = []
     device = torch.device(args.device)
     test_dl = create_dataset(args)
-    load_model_file = "./checkpoints/weights/checkpoint_TUT/checkpoint_TUT.pth"
     data_size = len(test_dl)
     model, criterion = build_model(args)
-    state_dict = torch.load(load_model_file)
+    state_dict = torch.load(args.model_file_path)
     model.load_state_dict(state_dict["model"])
     model.to(device)
     print("Load Model Successful!")
-    suffix = load_model_file.split('/')[-2]
+    suffix = args.model_file_path.split('/')[-2]
     save_root = "./results/results_test/" + suffix
     if not os.path.isdir(save_root):
         os.makedirs(save_root)
