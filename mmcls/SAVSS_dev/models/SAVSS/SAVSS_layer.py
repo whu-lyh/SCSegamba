@@ -15,6 +15,7 @@ from mamba_ssm.ops.triton.layernorm import RMSNorm
 from models.GBC import GBC, BottConv
 from models.PAF import PAF
 
+
 class SAVSS_2D(nn.Module):
     def __init__(
             self,
@@ -80,6 +81,7 @@ class SAVSS_2D(nn.Module):
             self.dt_proj.bias.copy_(inv_dt)
         self.dt_proj.bias._no_reinit = True
 
+        # S4D real initialization
         A = repeat(
             torch.arange(1, self.d_state + 1, dtype=torch.float32),
             "n -> d n",
@@ -159,6 +161,7 @@ class SAVSS_2D(nn.Module):
                     i_d = "down"
         d2 = [0] + d2[:-1]
 
+        # Diagonal route
         for diag in range(H + W - 1):
             if diag % 2 == 0:
                 for i in range(min(diag + 1, H)):
@@ -207,45 +210,48 @@ class SAVSS_2D(nn.Module):
         E = self.d_inner
 
         conv_state, ssm_state = None, None
-        xz = self.in_proj(x)
-        A = -torch.exp(self.A_log.float())
+        xz = self.in_proj(x) # [B, L, 2 * d_inner(8 * d_model)] a more efficient manner to process the input
+        A = -torch.exp(self.A_log.float()) # (d_inner, d_state)
 
-        x, z = xz.chunk(2, dim=-1)
+        x, z = xz.chunk(2, dim=-1) # split into two parts, each [B, L, d_inner(8 * d_model)]
         x_2d = x.reshape(batch_size, H, W, E).permute(0, 3, 1, 2)
         x_2d = self.act(self.conv2d(x_2d))
         x_conv = x_2d.permute(0, 2, 3, 1).reshape(batch_size, L, E)
-
-        x_dbl = self.x_proj(x_conv)
+        # construct dt, B, C
+        x_dbl = self.x_proj(x_conv) # (B, L, dt_rank + d_state * 2)
         dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         dt = self.dt_proj(dt)
-        dt = dt.permute(0, 2, 1).contiguous()
-        B = B.permute(0, 2, 1).contiguous()
-        C = C.permute(0, 2, 1).contiguous()
+        dt = dt.permute(0, 2, 1).contiguous() # [B, d_innter, L]
+        B = B.permute(0, 2, 1).contiguous() # [B, d_state, L]
+        C = C.permute(0, 2, 1).contiguous() # [B, d_state, L]
 
         assert self.activation in ["silu", "swish"]
 
         orders, inverse_orders, directions = self.sass(hw_shape)
-        direction_Bs = [self.direction_Bs[d, :] for d in directions]
-        direction_Bs = [dB[None, :, :].expand(batch_size, -1, -1).permute(0, 2, 1).to(dtype=B.dtype) for dB in
-                        direction_Bs]
+        direction_Bs = [self.direction_Bs[d, :] for d in directions] # each [L, d_state]
+        direction_Bs = [dB[None, :, :].expand(batch_size, -1, -1).permute(0, 2, 1).to(dtype=B.dtype) 
+                        for dB in direction_Bs] # each [B, d_state, L], note the .to(dtype=B.dtype) operation is to ensure dtype consistency
 
+        # S6 block
+        # y_scan: a list
         y_scan = [
             selective_scan_fn(
-                x_conv[:, o, :].permute(0, 2, 1).contiguous(),
-                dt,
+                x_conv[:, o, :].permute(0, 2, 1).contiguous(), # the input sequence should be BDL
+                dt, # selective factor
                 A,
-                (B + dB).contiguous(),
+                (B + dB).contiguous(), # dB operation is inherited from PlainMamba, which is the direction-aware update module for x
                 C,
                 self.D.float(),
                 z=None,
                 delta_bias=self.dt_proj.bias.float(),
                 delta_softplus=True,
                 return_last_state=ssm_state is not None,
-            ).permute(0, 2, 1)[:, inv_order, :]
+            ).permute(0, 2, 1)[:, inv_order, :] # permute back to original order, and the [:, inv_order, :] operations will transform the output sequences back to the original x order
             for o, inv_order, dB in zip(orders, inverse_orders, direction_Bs)
-        ]
+        ] # 4 scan sequences, each [B, L, d_inner(expand*d_model)]
 
-        y = sum(y_scan) * self.act(z)
+        # cause the y_scan's token order is consistent to the original order (position consistent one-by-one), we can directly sum them up
+        y = sum(y_scan) * self.act(z) # sum 4 sequences([B, L, d_inner]) and * z([B, L, d_inner])
         out = self.out_proj(y)
         if self.init_layer_scale is not None:
             out = out * self.gamma
@@ -261,7 +267,6 @@ class SAVSS_Layer(nn.Module):
             drop_path_rate,
             mamba_cfg,
     ):
-
         super(SAVSS_Layer, self).__init__()
         mamba_cfg.update({'d_model': embed_dims})
         if use_rms_norm:
@@ -269,6 +274,7 @@ class SAVSS_Layer(nn.Module):
         else:
             self.norm = nn.LayerNorm(embed_dims)
 
+        # ablation module switcher
         self.with_dwconv = with_dwconv
         if self.with_dwconv:
             self.dw = nn.Sequential(

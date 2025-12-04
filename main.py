@@ -77,7 +77,7 @@ def get_args_parser():
 def main(args):
     cur_time = time.strftime('%Y_%m_%d_%H_%M_%S', time.localtime(time.time()))
     dataset_name = (args.dataset_path).split('/')[-1]
-    folder_name = cur_time + '_Dataset->' + dataset_name
+    folder_name = cur_time + '_Dataset_' + dataset_name
     process_folder_path = os.path.join(args.output_dir, folder_name)
     args.phase = 'train'
     if not os.path.exists(process_folder_path):

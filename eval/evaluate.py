@@ -227,11 +227,18 @@ def eval(log_eval, results_dir, epoch):
     return {'epoch': epoch, 'mIoU': mIoU, 'ODS': ODS, 'OIS': OIS, 'F1': F_list[0], 'Precision': Precision_list[0], 'Recall': Recall_list[0]}
 
 if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser('SCSEGAMBA FOR CRACK')
+    parser.add_argument('--result_path', default="../data/TUT", help='Root directory path for test results')
+    args = parser.parse_args()
+
     suffix_gt = "lab"
     suffix_pred = "pre"
-    results_dir = "../results/results_test/TUT_results"
+    results_dir = args.result_path
     logging.info(results_dir)
     src_img_list, tgt_img_list, pred_imgs_names, gt_imgs_names = get_image_pairs(results_dir, suffix_gt, suffix_pred)
+    print("Images loaded!")
     assert len(src_img_list) == len(tgt_img_list)
     final_accuracy_all = cal_prf_metrics(src_img_list, tgt_img_list)
     final_accuracy_all = np.array(final_accuracy_all)
@@ -239,14 +246,11 @@ if __name__ == '__main__':
     mIoU = cal_mIoU_metrics(src_img_list,tgt_img_list, pred_imgs_names=pred_imgs_names, gt_imgs_names=gt_imgs_names)
     ODS = cal_ODS_metrics(src_img_list, tgt_img_list)
     OIS = cal_OIS_metrics(src_img_list, tgt_img_list)
-    print("mIouU -> " + str(mIoU))
+
     print("ODS -> " + str(ODS))
     print("OIS -> " + str(OIS))
-    print("F1 -> " + str(F_list[0]))
     print("P -> " + str(Precision_list[0]))
     print("R -> " + str(Recall_list[0]))
+    print("F1 -> " + str(F_list[0]))
+    print("mIouU -> " + str(mIoU))
     print("eval finish!")
-
-
-    
-
