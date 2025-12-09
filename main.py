@@ -4,23 +4,24 @@ Github: https://github.com/Karl1109
 Email: liuhui@ieee.org
 '''
 
-import os
 import argparse
 import datetime
+import os
 import random
 import time
 
+import cv2
 import numpy as np
 import torch
-import util.misc as utils
-from engine import train_one_epoch
-from models import build_model
-from datasets import create_dataset
-import cv2
-from eval.evaluate import eval
-from util.logger import get_logger
-from tqdm import tqdm
 from mmengine.optim.scheduler.lr_scheduler import PolyLR
+from tqdm import tqdm
+
+import util.misc as utils
+from datasets import create_dataset
+from engine import train_one_epoch
+from eval.evaluate import eval
+from models import build_model
+from util.logger import get_logger
 
 
 def get_args_parser():
@@ -34,6 +35,8 @@ def get_args_parser():
                         help='Normalization layer type [GN|BN], GN=GroupNorm')
     parser.add_argument('--dataset_path', default="../data/TUT",
                         help='Root directory path for dataset')
+    parser.add_argument('--exp_name', default="SAVSS",
+                        help='Identifier for the experiment')
     parser.add_argument('--batch_size_train', type=int, default=1,
                         help='Number of samples per training batch (affects memory usage)')
     parser.add_argument('--batch_size_test', type=int, default=1,
@@ -77,7 +80,7 @@ def get_args_parser():
 def main(args):
     cur_time = time.strftime('%Y_%m_%d_%H_%M_%S', time.localtime(time.time()))
     dataset_name = (args.dataset_path).split('/')[-1]
-    folder_name = cur_time + '_Dataset_' + dataset_name
+    folder_name = cur_time + '_' + dataset_name + '_' + args.exp_name
     process_folder_path = os.path.join(args.output_dir, folder_name)
     args.phase = 'train'
     if not os.path.exists(process_folder_path):
@@ -96,6 +99,7 @@ def main(args):
     log_train = get_logger(process_folder_path, 'train')
     log_test = get_logger(process_folder_path, 'test')
     log_eval = get_logger(process_folder_path, 'eval')
+
 
     log_train.info("args -> " + str(args))
     log_train.info("args: dataset -> " + str(args.dataset_path))

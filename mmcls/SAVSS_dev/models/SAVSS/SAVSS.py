@@ -4,25 +4,27 @@ Github: https://github.com/Karl1109
 Email: liuhui@ieee.org
 '''
 
-from typing import Sequence
 import copy
+from typing import Sequence
+
 import numpy as np
 import torch
 import torch.nn as nn
 from timm.models.layers import DropPath, trunc_normal_
+
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
 from mmcv.cnn import build_norm_layer
 from mmcv.cnn.utils.weight_init import trunc_normal_
 from mmcv.runner.base_module import ModuleList
-
 from rotary_embedding_torch import RotaryEmbedding
 
+from mmcls.models.backbones.base_backbone import BaseBackbone
 from mmcls.models.builder import BACKBONES
 from mmcls.models.utils import resize_pos_embed, to_2tuple
-from mmcls.models.backbones.base_backbone import BaseBackbone
 from mmcls.SAVSS_dev.models.modules.patch_embed import ConvPatchEmbed
 from mmcls.SAVSS_dev.models.SAVSS.SAVSS_layer import SAVSS_Layer
 from models.GBC import BottConv
+
 
 @BACKBONES.register_module()
 class SAVSS(BaseBackbone):
@@ -32,6 +34,7 @@ class SAVSS(BaseBackbone):
             'embed_dims': 256,
             'num_layers': 4,
             'num_convs_patch_embed': 2,
+            'with_rope_pos_embed': False,
             'layers_with_dwconv': [],
             'layer_cfgs': {
                 'use_rms_norm': False,
@@ -95,7 +98,7 @@ class SAVSS(BaseBackbone):
             _layer_cfgs = self.arch_zoo[self.arch]['layer_cfgs']
 
         self.with_pos_embed = with_pos_embed
-        self.with_rope_pos_embed = with_rope_pos_embed
+        self.with_rope_pos_embed = with_rope_pos_embed # FIXME: BUG MAY EXIST!
         self.interpolate_mode = interpolate_mode
         self.freeze_patch_embed = freeze_patch_embed
         _drop_path_rate = drop_path_rate
@@ -112,7 +115,7 @@ class SAVSS(BaseBackbone):
         self.patch_resolution = self.patch_embed.init_out_size
         num_patches = self.patch_resolution[0] * self.patch_resolution[1]
         if with_pos_embed:
-            if with_rope_pos_embed:
+            if self.with_rope_pos_embed:
                 self.pos_embed = RotaryEmbedding(dim=self.embed_dims)
             else:
                 self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, self.embed_dims))
@@ -183,7 +186,7 @@ class SAVSS(BaseBackbone):
     def init_weights(self):
         super(SAVSS, self).init_weights()
         if not (isinstance(self.init_cfg, dict)
-                and self.init_cfg['type'] == 'Pretrained'):
+                and self.init_cfg['type'] == 'Pretrained'): # actually no pretrained weights available
             if self.with_pos_embed:
                 if not self.with_rope_pos_embed:
                     trunc_normal_(self.pos_embed, std=0.02)
@@ -211,7 +214,7 @@ class SAVSS(BaseBackbone):
                 x = x + pos_embed
         x = self.drop_after_pos(x)
 
-        outs_before = []
+        # outs_before = []
         outs = []
         for i, layer in enumerate(self.layers):
             x = layer(x, hw_shape=patch_resolution)
@@ -225,7 +228,7 @@ class SAVSS(BaseBackbone):
                     norm_layer = getattr(self, f'norm_layer{i}')
                     patch_token = norm_layer(patch_token)
                 patch_token = patch_token.permute(0, 3, 1, 2)
-                outs_before.append(patch_token)
+                # outs_before.append(patch_token)
 
                 if i == self.out_indices[0]:
                     patch_token_mid = self.gn128(self.conv256to128(patch_token))

@@ -5,13 +5,15 @@ Email: liuhui@ieee.org
 '''
 
 import math
-from einops import repeat
+
 import torch
 import torch.nn as nn
-from mmcv.cnn.bricks.transformer import build_dropout
-from mmcv.cnn.utils.weight_init import trunc_normal_
+from einops import repeat
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 from mamba_ssm.ops.triton.layernorm import RMSNorm
+from mmcv.cnn.bricks.transformer import build_dropout
+from mmcv.cnn.utils.weight_init import trunc_normal_
+
 from models.GBC import GBC, BottConv
 from models.PAF import PAF
 
@@ -239,7 +241,8 @@ class SAVSS_2D(nn.Module):
                 x_conv[:, o, :].permute(0, 2, 1).contiguous(), # the input sequence should be BDL
                 dt, # selective factor
                 A,
-                (B + dB).contiguous(), # dB operation is inherited from PlainMamba, which is the direction-aware update module for x
+                # (B + dB).contiguous(), # dB operation is inherited from PlainMamba, which is the direction-aware update module for x
+                B, # original mamba update manner
                 C,
                 self.D.float(),
                 z=None,
