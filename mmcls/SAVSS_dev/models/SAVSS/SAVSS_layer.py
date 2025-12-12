@@ -83,7 +83,7 @@ class SAVSS_2D(nn.Module):
             self.dt_proj.bias.copy_(inv_dt)
         self.dt_proj.bias._no_reinit = True
 
-        # S4D real initialization
+        # S4 real initialization
         A = repeat(
             torch.arange(1, self.d_state + 1, dtype=torch.float32),
             "n -> d n",

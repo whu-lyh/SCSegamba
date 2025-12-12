@@ -6,8 +6,11 @@ Email: liuhui@ieee.org
 
 import torch
 from torch import nn
+
+from mmcls.SAVSS_dev.models.SAVSS.HSMM import HSMM
 from mmcls.SAVSS_dev.models.SAVSS.SAVSS import SAVSS
 from models.MFS import MFS
+
 
 class Decoder(nn.Module):
     def __init__(self, backbone, args=None):
@@ -51,11 +54,21 @@ def build(args):
     device = torch.device(args.device)
     args.device = torch.device(args.device)
 
-    backbone = SAVSS(arch='Crack',
-                     out_indices=(0, 1, 2, 3),
-                     drop_path_rate=0.2,
-                     final_norm=True,
-                     convert_syncbn=True)
+    if args.model_mode == 'SAVSS':
+        backbone = SAVSS(arch='Crack',
+                        out_indices=(0, 1, 2, 3),
+                        drop_path_rate=0.2,
+                        final_norm=True,
+                        convert_syncbn=True)
+    elif args.model_mode == 'HSMM':
+        backbone = HSMM(arch='Crack',
+                        out_indices=(0, 1, 2, 3),
+                        drop_path_rate=0.2,
+                        final_norm=True,
+                        convert_syncbn=True)
+    else:
+        raise NotImplementedError(f"Model mode {args.model_mode} is not implemented.")
+
     model = Decoder(backbone, args)
     criterion = bce_dice(args)
     criterion.to(device)
