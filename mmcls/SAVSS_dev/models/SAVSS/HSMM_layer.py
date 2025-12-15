@@ -4,15 +4,13 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import repeat
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 from mamba_ssm.ops.triton.layernorm import RMSNorm
 from mmcv.cnn.bricks.transformer import build_dropout
-from mmcv.cnn.utils.weight_init import trunc_normal_
 from pyzorder import ZOrderIndexer
 
-from mmcls.SAVSS_dev.models.SAVSS.moe_layer import FeedForward, SwitchGate_Conv
+from mmcls.SAVSS_dev.models.SAVSS.moe_layer import FeedForward, SwitchGate, SwitchGate_Conv
 from models.GBC import GBC, BottConv
 from models.PAF import PAF
 from util import hilbert
@@ -21,32 +19,49 @@ from util import hilbert
 class SerializationStrategies_base(nn.Module):
     def __init__(self):
         super().__init__()
-        self.H = 0
-        self.W = 0
-        self.L = self.H * self.W
-    
-    def sass(self):
-        o1, o2, o3, o4 = [], [], [], []
-        d1, d2, d3, d4 = [], [], [], []
-        o1_inverse = [-1 for _ in range(self.L)]
-        o2_inverse = [-1 for _ in range(self.L)]
-        o3_inverse = [-1 for _ in range(self.L)]
-        o4_inverse = [-1 for _ in range(self.L)]
 
-        if self.H % 2 == 1:
-            i, j = self.H - 1, self.W - 1
+    def Parallel_snake_horizontal(self, hw_shape):
+        """
+        Generate a horizontal snake-like traversal order for an H×W grid.
+
+        This function constructs a “snake” (zig-zag) scanning order over a 2D grid,
+        starting from the bottom row. The traversal direction alternates between
+        left-to-right and right-to-left for each row, producing a continuous
+        one-dimensional index sequence. It also computes the inverse mapping from
+        grid index to its position in the snake order.
+
+        Args:
+            hw_shape (tuple): A tuple (H, W) specifying the grid height and width.
+
+        Returns:
+            tuple:
+                o1 (list[int]): A list of length H*W containing the linear
+                    indices of the grid visited in snake order.
+                o1_inverse (list[int]): A list of length H*W where each entry
+                    gives the position of the corresponding grid index in `o1`.
+                    For index k in the grid, `o1_inverse[k]` is its order in the
+                    snake traversal.
+        """
+        H, W = hw_shape
+        L = H * W
+        o1 = []
+        d1 = []
+        o1_inverse = [-1 for _ in range(L)]
+
+        if H % 2 == 1:
+            i, j = H - 1, W - 1
             j_d = "left"
         else:
-            i, j = self.H - 1, 0
+            i, j = H - 1, 0
             j_d = "right"
 
         while i > -1:
             assert j_d in ["right", "left"]
-            idx = i * self.W + j
+            idx = i * W + j
             o1_inverse[idx] = len(o1)
             o1.append(idx)
             if j_d == "right":
-                if j < self.W - 1:
+                if j < W - 1:
                     j = j + 1
                     d1.append(1)
                 else:
@@ -63,118 +78,389 @@ class SerializationStrategies_base(nn.Module):
                     j_d = "right"
         d1 = [0] + d1[:-1]
 
+        return o1, o1_inverse
+
+    def Parallel_snake_horizontal2(self, hw_shape):
+        """
+        Generate a horizontal serpentine (snake-like) scan order starting from
+        the top-left corner of the grid.
+
+        This method performs a row-wise traversal beginning at (0, 0). For each row,
+        the scanning direction alternates: even-indexed rows move left-to-right,
+        while odd-indexed rows move right-to-left. The traversal continues until all
+        H × W grid elements are visited. Direction codes are internally recorded
+        but not returned, except for the forward scan order.
+
+        Args:
+            hw_shape (tuple[int, int]):
+                A tuple (H, W) specifying the grid height and width.
+
+        Returns:
+            tuple[list[int], list[int]]:
+                - o1: Forward scan order following the horizontal serpentine traversal.
+                    Each element corresponds to a flattened grid index i * W + j.
+                - o1_inverse: Inverse mapping array where o1_inverse[idx] gives the
+                            position of index `idx` in the serialized forward path.
+                            This enables O(1) lookup from grid index to traversal order.
+        """
+        H, W = hw_shape
+        L = H * W
+
+        o1 = []
+        d1 = []
+        o1_inverse = [-1 for _ in range(L)]
+        i, j = 0, 0
+        j_d = "right"
+        while i < H:
+            assert j_d in ["right", "left"]
+            idx = i * W + j
+            o1_inverse[idx] = len(o1)
+            o1.append(idx)
+            if j_d == "right":
+                if j < W-1:
+                    j = j + 1
+                    d1.append(1)
+                else:
+                    i = i + 1
+                    d1.append(4)
+                    j_d = "left"
+            else:
+                if j > 0:
+                    j = j - 1
+                    d1.append(2)
+                else:
+                    i = i + 1
+                    d1.append(4)
+                    j_d = "right"
+        d1 = [0] + d1[:-1]
+
+        return o1, o1_inverse
+
+    def Parallel_snake_vertical(self, hw_shape):
+        """
+        Generate a vertical snake-like traversal order for an H×W grid.
+
+        This function constructs a vertical “snake” (zig-zag) scanning order over
+        a 2D grid. The traversal proceeds column by column: in even-indexed
+        columns it scans from top to bottom, and in odd-indexed columns it scans
+        bottom to top. This produces a continuous 1D index sequence. The function
+        also returns the inverse mapping from each grid index to its position
+        in the snake traversal.
+
+        Args:
+            hw_shape (tuple):
+                A tuple (H, W) specifying the grid height and width.
+
+        Returns:
+            tuple:
+                o1 (list[int]):
+                    A list of length H*W containing the linear indices of all
+                    grid cells visited in vertical snake order.
+                o1_inverse (list[int]):
+                    A list of length H*W that maps each grid index to its order
+                    in the snake traversal. For any index k, `o1_inverse[k]`
+                    gives its position within `o1`.
+        """
+        H, W = hw_shape
+        L = H * W
+        o1 = []
+        d1 = []
+        o1_inverse = [-1 for _ in range(L)]
+
         i, j = 0, 0
         i_d = "down"
-        while j < self.W:
+        while j < W:
             assert i_d in ["down", "up"]
-            idx = i * self.W + j
-            o2_inverse[idx] = len(o2)
-            o2.append(idx)
+            idx = i * W + j
+            o1_inverse[idx] = len(o1)
+            o1.append(idx)
             if i_d == "down":
-                if i < self.H - 1:
+                if i < H - 1:
                     i = i + 1
-                    d2.append(4)
+                    d1.append(4)
                 else:
                     j = j + 1
-                    d2.append(1)
+                    d1.append(1)
                     i_d = "up"
             else:
                 if i > 0:
                     i = i - 1
-                    d2.append(3)
+                    d1.append(3)
                 else:
                     j = j + 1
-                    d2.append(1)
+                    d1.append(1)
                     i_d = "down"
-        d2 = [0] + d2[:-1]
+        d1 = [0] + d1[:-1]
+
+        return o1, o1_inverse
+
+    def Diagonal_snake_left(self, hw_shape):
+        """
+        Generate a diagonal snake-like traversal order for an H×W grid (left-aligned).
+
+        This function constructs a diagonal zig-zag traversal over a 2D grid along
+        all anti-diagonals (i.e., where i + j = constant). The traversal direction
+        alternates between diagonals: even-indexed diagonals iterate in one order
+        (i-first), and odd-indexed diagonals iterate in the opposite order
+        (j-first). This produces a continuous snake-like sequence without
+        horizontal mirroring (i.e., left-aligned). The function also computes
+        the inverse mapping that records the position of each grid index in the
+        traversal sequence.
+
+        Args:
+            hw_shape (tuple):
+                A tuple (H, W) specifying the grid height (H) and width (W).
+
+        Returns:
+            tuple:
+                o1 (list[int]):
+                    A list of length H*W containing the linear indices of all grid
+                    elements visited in diagonal snake order.
+                o1_inverse (list[int]):
+                    A list of length H*W where each entry gives the position
+                    of the corresponding grid index in `o1`. For index k,
+                    `o1_inverse[k]` returns its traversal order.
+        """
+        H, W = hw_shape
+        L = H * W
+        o1 = []
+        d1 = []
+        o1_inverse = [-1 for _ in range(L)]
 
         # Diagonal route
-        for diag in range(self.H + self.W - 1):
+        for diag in range(H + W - 1):
             if diag % 2 == 0:
-                for i in range(min(diag + 1, self.H)):
+                # Even diagonal: iterate by i first
+                for i in range(min(diag + 1, H)):
                     j = diag - i
-                    if j < self.W:
-                        idx = i * self.W + j
-                        o3.append(idx)
-                        o3_inverse[idx] = len(o1) - 1
-                        d3.append(1 if j == diag else 4)
+                    if j < W:
+                        idx = i * W + j
+                        o1.append(idx)
+                        o1_inverse[idx] = len(o1) - 1
+                        d1.append(1 if j == diag else 4)
             else:
-                for j in range(min(diag + 1, self.W)):
+                # Odd diagonal: iterate by j first
+                for j in range(min(diag + 1, W)):
                     i = diag - j
-                    if i < self.H:
-                        idx = i * self.W + j
-                        o3.append(idx)
-                        o3_inverse[idx] = len(o1) - 1
-                        d3.append(4 if i == diag else 1)
-        d3 = [0] + d3[:-1]
+                    if i < H:
+                        idx = i * W + j
+                        o1.append(idx)
+                        o1_inverse[idx] = len(o1) - 1
+                        d1.append(4 if i == diag else 1)
+        d1 = [0] + d1[:-1]
 
-        for diag in range(self.H + self.W - 1):
-            if diag % 2 == 0:
-                for i in range(min(diag + 1, self.H)):
-                    j = diag - i
-                    if j < self.W:
-                        idx = i * self.W + (self.W - j - 1)
-                        o4.append(idx)
-                        o4_inverse[idx] = len(o4) - 1
-                        d4.append(1 if j == diag else 4)
-            else:
-                for j in range(min(diag + 1, self.W)):
-                    i = diag - j
-                    if i < self.H:
-                        idx = i * self.W + (self.W - j - 1)
-                        o4.append(idx)
-                        o4_inverse[idx] = len(o4) - 1
-                        d4.append(4 if i == diag else 1)
-        d4 = [0] + d4[:-1]
+        return o1, o1_inverse
 
-        return [o1, o2, o3, o4], [o1_inverse, o2_inverse, o3_inverse, o4_inverse]
+    def Diagonal_snake_right(self, hw_shape):
+        """
+        Generate a diagonal snake-like traversal order for an H×W grid (right-aligned).
 
-    def zigzag(self):
-        indexes = np.arange(self.L)
-        indexes = indexes.reshape(self.H, self.W)
+        This function constructs a diagonal “snake” scanning order over a 2D grid.
+        The traversal proceeds along all anti-diagonals of the grid (i.e., lines
+        where i + j = constant). For each diagonal, the direction alternates:
+        even-indexed diagonals are visited in one orientation, and odd-indexed
+        diagonals in the opposite orientation. The traversal is additionally
+        mirrored horizontally (right-aligned), meaning that the column index is
+        transformed as (W - j - 1). This produces a continuous 1D index sequence.
+        The function also computes the inverse mapping from each grid index to
+        its position in this diagonal snake traversal.
+
+        Args:
+            hw_shape (tuple):
+                A tuple (H, W) specifying the grid height and width.
+
+        Returns:
+            tuple:
+                o1 (list[int]):
+                    A list of length H*W containing the linear grid indices in
+                    the diagonal snake traversal order.
+                o1_inverse (list[int]):
+                    A list of length H*W mapping each grid index to its
+                    occurrence position within `o1`.
+                    For index k, `o1_inverse[k]` gives the traversal rank.
+        """
+        H, W = hw_shape
+        L = H * W
         o1 = []
-        for i in range(2 * self.H - 1): # FIXME: CHECKOUT IT OUT H OR W
-            if i % 2 == 0:
-                start_col = max(0, i - self.W + 1)
-                end_col = min(i, self.W - 1)
-                for j in range(start_col, end_col + 1):
-                    o1.append(indexes[i - j, j])
+        d1 = []
+        o1_inverse = [-1 for _ in range(L)]
+
+        for diag in range(H + W - 1):
+            if diag % 2 == 0:
+                # Even diagonals: iterate i first
+                for i in range(min(diag + 1, H)):
+                    j = diag - i
+                    if j < W:
+                        idx = i * W + (W - j - 1)
+                        o1.append(idx)
+                        o1_inverse[idx] = len(o1) - 1
+                        d1.append(1 if j == diag else 4)
             else:
-                start_row = max(0, i - self.H + 1)
-                end_row = min(i, self.H - 1)
-                for j in range(start_row, end_row + 1):
-                    o1.append(indexes[j, i - j])
+                # Odd diagonals: iterate j first
+                for j in range(min(diag + 1, W)):
+                    i = diag - j
+                    if i < H:
+                        idx = i * W + (W - j - 1)
+                        o1.append(idx)
+                        o1_inverse[idx] = len(o1) - 1
+                        d1.append(4 if i == diag else 1)
+        d1 = [0] + d1[:-1]
+
+        return o1, o1_inverse
+
+    def zigzag(self, hw_shape):
+        """
+        Generate a zigzag traversal order for an H×W grid (classic JPEG-style).
+
+        This function computes a zigzag (diagonal sweep) ordering over a 2D grid.
+        The traversal follows the conventional pattern used in JPEG block
+        processing: the grid is visited along diagonals of length varying between
+        1 and min(H, W), and the direction alternates between each diagonal.
+        This produces a continuous sequence that preserves local spatial
+        relationships more effectively than simple raster scanning.
+
+        Args:
+            hw_shape (tuple):
+                A tuple (H, W) specifying the grid height and width.
+
+        Returns:
+            tuple:
+                o1 (list[int]):
+                    A list of length H*W containing the linear grid indices
+                    visited in zigzag order.
+                o1_inverse (list[int]):
+                    A list of length H*W where each element gives the position
+                    of the corresponding linear index in the zigzag traversal.
+                    For index k, `o1_inverse[k]` returns its zigzag rank.
+        """
+        H, W = hw_shape
+        o1 = []
+
+        # Diagonal zigzag traversal
+        # Total number of diagonals = H + W - 1
+        for diag in range(H + W - 1):
+            # Compute valid row/col ranges on this diagonal
+            row_start = max(0, diag - (W - 1))
+            row_end   = min(diag, H - 1)
+            if diag % 2 == 0:
+                # Even diag → traverse from high row to low row:
+                # (r decreases, c increases)
+                for r in range(row_end, row_start - 1, -1):
+                    c = diag - r
+                    o1.append(r * W + c)
+            else:
+                # Odd diag → traverse from low row to high row:
+                # (r increases, c decreases)
+                for r in range(row_start, row_end + 1):
+                    c = diag - r
+                    o1.append(r * W + c)
+
         o1 = np.array(o1)
         o1_inverse = np.argsort(o1)
+
         return o1.tolist(), o1_inverse.tolist()
 
-    def zorder(self):
-        indexes = np.arange(self.L)
-        zi = ZOrderIndexer((0, self.H - 1), (0, self.W - 1))
+    def zorder(self, hw_shape):
+        """
+        Generate a Z-order (Morton order) traversal sequence for an H×W grid.
+
+        This function computes the Morton (Z-order) curve indexing for a 2D grid.
+        Z-order is a space-filling curve that interleaves the bit representations
+        of row and column coordinates to preserve spatial locality. Given a grid
+        of shape H×W, the function returns both the forward Z-order sequence and
+        its inverse mapping.
+
+        Args:
+            hw_shape (tuple):
+                A tuple (H, W) specifying the grid height and width.
+
+        Returns:
+            tuple:
+                o1 (list[int]):
+                    A list of length H*W containing the Morton-order linear
+                    indices. Each entry corresponds to a grid cell visited in
+                    Z-order.
+                o1_inverse (list[int]):
+                    A list of length H*W where each element gives the position
+                    of the corresponding linear index in the Z-order sequence.
+                    For index k, `o1_inverse[k]` returns its Morton traversal rank.
+        """
+        H, W = hw_shape
+        indexes = np.arange(H * W)
+        zi = ZOrderIndexer((0, H - 1), (0, W - 1))
         o1 = []
+
         for z in indexes:
             r, c = zi.rc(int(z))
-            o1.append(c * self.H + r)
+            o1.append(r * H + c)
+
         o1 = np.array(o1)
         o1_inverse = np.argsort(o1)
+
+        return o1.tolist(), o1_inverse.tolist()
+
+    def scan(self, hw_shape):
+        """
+        Generate a scan-line traversal order with alternating row directions.
+
+        This serialization method performs a horizontal scan over the grid but
+        reverses every second row to create a snake-like left-to-right then
+        right-to-left pattern. Unlike `parallel_snake_horizontal`, which may start
+        scanning from the bottom or top depending on grid parity, this method always
+        starts from the top-left corner and alternates direction strictly based on
+        row index parity.
+
+        Args:
+            hw_shape (tuple[int, int]):
+                A tuple (H, W) representing the grid height and width.
+
+        Returns:
+            tuple[list[int], list[int]]:
+                - o1: A list of indices representing the forward scan traversal
+                    following the alternating-direction pattern.
+                - o1_inverse: A list where each position stores the inverse mapping,
+                            such that `o1_inverse[o1[k]] = k`, enabling fast lookup
+                            of the position of each grid index in the serialized order.
+        """
+        H, W = hw_shape
+        indexes = np.arange(H * W)
+        indexes = indexes.reshape(H, W)
+        for i in np.arange(1, H, step=2):
+            indexes[i, :] = indexes[i, :][::-1]
+        o1 = indexes.reshape(-1)
+
+        o1 = np.array(o1)
+        o1_inverse = np.argsort(o1)
+
+        return o1.tolist(), o1_inverse.tolist()
+
+    def hilbert(self, hw_shape):
+        H, W = hw_shape
+        indexes = np.arange(H * W)
+        bit = int(math.log2(H))
+        locs = hilbert.decode(torch.tensor(indexes), 2, bit)
+        ret = []
+        l = 2 ** bit
+        for i in range(len(locs)):
+            loc = locs[i]
+            loc_flat = 0
+            for j in range(2):
+                loc_flat += loc[j] * (l ** j)
+            ret.append(loc_flat)
+
+        o1 = np.array(ret).astype(np.uint64)
+        o1_inverse = np.argsort(o1)
+
         return o1.tolist(), o1_inverse.tolist()
     
     def forward(self, hw_shape):
-        self.H, self.W = hw_shape
-        self.L = self.H * self.W
         o, o_inverse = [], []
-        for ss in [self.zorder(), self.sass(), self.zigzag()]:
+        for ss in [self.Parallel_snake_horizontal2(hw_shape),
+                    self.Parallel_snake_vertical(hw_shape), 
+                   self.Diagonal_snake_left(hw_shape), 
+                   self.zigzag(hw_shape)]:
             o_seq, o_inv_seq = ss
-            if type(o_seq) is list:
-                for oi in o_seq:
-                     o.append(oi)
-            else:
-                o.append(o_seq)
-            if type(o_inverse) is list:
-                for ioi in o_inv_seq:
-                     o_inverse.append(ioi)
-            else:
-                o_inverse.append(o_inverse)
+            o.append(o_seq)
             o_inverse.append(o_inv_seq)
         return o, o_inverse
 
@@ -628,7 +914,7 @@ class SerializationStrategies:
         o1_inverse = np.argsort(o1)
 
         return o1.tolist(), o1_inverse.tolist()
-       
+
 
 class S6_2D(nn.Module):
     def __init__(
@@ -930,6 +1216,7 @@ class SwitchMoE_HS(nn.Module):
         capacity_factor: float = 1.0,
         mult: int = 4,
         use_aux_loss: bool = False,
+        use_conv_gate: bool = False,
         *args,
         **kwargs,
     ):
@@ -962,23 +1249,32 @@ class SwitchMoE_HS(nn.Module):
             self.experts.append(expert)
 
         # -------- Gating -----------
-        self.gate = SwitchGate_Conv(
-            self.dim,
-            self.num_experts,
-            self.capacity_factor,
-        )
+        self.use_conv_gate = use_conv_gate
+        if self.use_conv_gate:
+            self.gate = SwitchGate_Conv(
+                self.dim,
+                self.num_experts,
+                self.capacity_factor,
+            )
+        else:
+            self.gate = SwitchGate(
+                self.dim,
+                self.num_experts,
+                self.capacity_factor,
+            )
 
     def forward(self, x: torch.Tensor, hw_shape):
         """
         Forward pass of the SwitchMoE_HS module.
 
         Args:
-            x (Tensor): The input tensor.
+            x (Tensor): The input tensor. shape is BLC
 
         Returns:
             Tensor: The output tensor of the MoE.
 
         """
+        # if self.use_conv_gate:
         B, L, C = x.shape
         H = W = int(math.sqrt(L))
         x = x.reshape(B, H, W, C).permute(0, 3, 1, 2)
@@ -986,6 +1282,7 @@ class SwitchMoE_HS(nn.Module):
         # (batch_size, seq_len, num_experts)
         gate_scores, loss = self.gate(x, use_aux_loss=self.use_aux_loss)
         
+        # if self.use_conv_gate:
         x = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
 
         # Dispatch to experts
@@ -1005,7 +1302,7 @@ class SwitchMoE_HS(nn.Module):
 
         # Combine expert outputs and gating scores
         # print(gate_scores.unsqueeze(-2).shape)
-        # print(stacked_expert_outputs.shape)
+        # print(stacked_expert_outputs.shape) # FIXME? IS THIS RIGHT?
         moe_output = torch.sum(
             gate_scores.unsqueeze(-2).unsqueeze(-2) * stacked_expert_outputs, dim=-1
         )
@@ -1076,6 +1373,7 @@ class HSMM_layer(nn.Module):
         # TODO
         
         # version2: inject SSM into experts
+        # x shape conversion is set inside HSMM
         (mixed_x, _) = self.HSMM(self.norm(x), hw_shape)
         mixed_x = self.drop_path(mixed_x)
         

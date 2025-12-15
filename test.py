@@ -24,6 +24,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=1, help='Number of samples per batch')
     parser.add_argument('--device', default='cuda', help='Computation device [cuda|cpu] for training/inference')
     parser.add_argument('--dataset_mode', type=str, default='crack', help='Dataset mode selector')
+    parser.add_argument('--model_mode', type=str, default='SAVSS', help='Model mode selector')
     parser.add_argument('--dataset_path', default="../data/TUT", help='Root directory path for dataset')
     parser.add_argument('--model_file_path', default="../data/TUT", help='Root directory path for checkpoint file')
     parser.add_argument('--result_save_path', default="../data/TUT", help='Root directory path for test results')

@@ -21,7 +21,7 @@ from datasets import create_dataset
 from engine import train_one_epoch
 from eval.evaluate import eval
 from models import build_model
-from util.logger import get_logger
+from util.logger import ExpertUtilizationLogger, get_logger
 
 
 def get_args_parser():
@@ -65,6 +65,8 @@ def get_args_parser():
                         help='Random seed')
     parser.add_argument('--dataset_mode', type=str, default='crack',
                         help='Dataset mode selector')
+    parser.add_argument('--model_mode', type=str, default='SAVSS',
+                        help='Model mode selector')
     parser.add_argument('--serial_batches', action='store_true',
                         help='Disable random shuffling and use sequential batch sampling if enabled')
     parser.add_argument('--num_threads', default=1, type=int,
@@ -99,7 +101,7 @@ def main(args):
     log_train = get_logger(process_folder_path, 'train')
     log_test = get_logger(process_folder_path, 'test')
     log_eval = get_logger(process_folder_path, 'eval')
-
+    # log_expert_stats = ExpertUtilizationLogger(num_experts=4, log_interval=20, log_file=process_folder_path + '/expert_stats.csv', use_tb=True)
 
     log_train.info("args -> " + str(args))
     log_train.info("args: dataset -> " + str(args.dataset_path))

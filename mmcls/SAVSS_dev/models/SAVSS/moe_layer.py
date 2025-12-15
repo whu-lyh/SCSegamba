@@ -68,18 +68,21 @@ class SwitchGate(nn.Module):
         self.capacity_factor = capacity_factor
         self.epsilon = epsilon
         self.w_gate = nn.Linear(dim, num_experts)
+        self.pooling = nn.AdaptiveAvgPool2d(1)
+        # self.conv_pooling = nn.Conv2d(C, out_dim, kernel_size=1) # TODO
 
     def forward(self, x: Tensor, use_aux_loss=False):
         """
         Forward pass of the SwitchGate module.
 
         Args:
-            x (Tensor): Input tensor. shape should be BC
+            x (Tensor): Input tensor. shape should be BCHW for a given image feature map
 
         Returns:
-            Tensor: Gate scores.
+            Tensor: Gate scores. shape should be [B, num_experts]
         """
         # Compute gate scores
+        x = self.pooling(x).flatten(1)
         gate_scores = F.softmax(self.w_gate(x), dim=-1)
 
         # Determine the top-1 expert for each token
@@ -245,10 +248,10 @@ class SwitchGate_Conv(nn.Module):
         Forward pass of the SwitchGate_Conv module.
 
         Args:
-            x (Tensor): Input tensor.
+            x (Tensor): Input tensor. shape should be BCHW
 
         Returns:
-            Tensor: Gate scores.
+            Tensor: Gate scores. shape should be [B, num_experts]
         """
         # Compute gate scores, flatten the last two dimensions
         gate_scores = F.softmax(torch.flatten(self.w_gate(x), 1), dim=-1)
