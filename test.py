@@ -25,6 +25,9 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='cuda', help='Computation device [cuda|cpu] for training/inference')
     parser.add_argument('--dataset_mode', type=str, default='crack', help='Dataset mode selector')
     parser.add_argument('--model_mode', type=str, default='SAVSS', help='Model mode selector')
+    parser.add_argument('--use_conv_gate', action='store_true', help='Use convolutional gating mechanism in the model if enabled')
+    parser.add_argument('--use_noisy_gate', action='store_true', help='Use noisy gating mechanism in the model if enabled')
+    parser.add_argument('--use_residual_connection', action='store_true', help='Use residual connections in the model if enabled')
     parser.add_argument('--dataset_path', default="../data/TUT", help='Root directory path for dataset')
     parser.add_argument('--model_file_path', default="../data/TUT", help='Root directory path for checkpoint file')
     parser.add_argument('--result_save_path', default="../data/TUT", help='Root directory path for test results')
@@ -51,7 +54,10 @@ if __name__ == '__main__':
             target = data["label"]
             if device != 'cpu':
                 x, target = x.cuda(), target.to(dtype=torch.int64).cuda()
-            out = model(x)
+            if args.use_noisy_gate:
+                out, _ = model(x)
+            else:
+                out = model(x)
 
             target = target[0, 0, ...].cpu().numpy()
             out = out[0, 0, ...].cpu().numpy()

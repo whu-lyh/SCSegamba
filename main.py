@@ -67,6 +67,12 @@ def get_args_parser():
                         help='Dataset mode selector')
     parser.add_argument('--model_mode', type=str, default='SAVSS',
                         help='Model mode selector')
+    parser.add_argument('--use_conv_gate', action='store_true',
+                        help='Use convolutional gating mechanism in the model if enabled')
+    parser.add_argument('--use_noisy_gate', action='store_true',
+                        help='Use noisy gating mechanism in the model if enabled')
+    parser.add_argument('--use_residual_connection', action='store_true',
+                        help='Use residual connections in the model if enabled')
     parser.add_argument('--serial_batches', action='store_true',
                         help='Disable random shuffling and use sequential batch sampling if enabled')
     parser.add_argument('--num_threads', default=1, type=int,
@@ -188,8 +194,12 @@ def main(args):
                 target = data["label"]
                 if device != 'cpu':
                     x, target = x.cuda(), target.to(dtype=torch.int64).cuda()
-                out = model(x)
-                loss = criterion(out, target.float())
+                if args.use_noisy_gate:
+                    out, load_balance_loss = model(x)
+                    loss = load_balance_loss + criterion(out, target.float())
+                else:
+                    out = model(x)
+                    loss = criterion(out, target.float())
                 target = target[0, 0, ...].cpu().numpy()
                 out = out[0, 0, ...].cpu().numpy()
                 root_name = data["A_paths"][0].split("/")[-1][0:-4]
@@ -200,11 +210,11 @@ def main(args):
                 # out[out >= 0.5] = 255
                 # out[out < 0.5] = 0
                 # the metric calculation relys on the saved images, so we save them all !!!
-                log_test.info('----------------------------------------------------------------------------------------------')
+                # log_test.info('----------------------------------------------------------------------------------------------')
                 log_test.info("loss -> " + str(loss))
-                log_test.info(str(os.path.join(save_root, "{}_lab.png".format(root_name))))
-                log_test.info(str(os.path.join(save_root, "{}_pre.png".format(root_name))))
-                log_test.info('----------------------------------------------------------------------------------------------')
+                # log_test.info(str(os.path.join(save_root, "{}_lab.png".format(root_name))))
+                # log_test.info(str(os.path.join(save_root, "{}_pre.png".format(root_name))))
+                # log_test.info('----------------------------------------------------------------------------------------------')
                 cv2.imwrite(os.path.join(save_root, "{}_lab.png".format(root_name)), target)
                 cv2.imwrite(os.path.join(save_root, "{}_pre.png".format(root_name)), out)
                 pbar.set_description(f"Loss: {loss.item():.4f}")

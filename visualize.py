@@ -503,6 +503,393 @@ def plot_serializations(serializations, H, W):
         print(f"Saved {filename}")
 
 
+
+
+@torch.no_grad()
+def indices_to_row_col(indices: torch.Tensor, width: int):
+    """
+    Convert 1D linear indices to 2D spatial coordinates.
+
+    Args:
+        indices (Tensor): 1D tensor of linear indices, shape (L,).
+        width (int): Image width.
+
+    Returns:
+        row (Tensor): Row indices, shape (L,).
+        col (Tensor): Column indices, shape (L,).
+    """
+    row = indices // width
+    col = indices % width
+    return row, col
+
+
+@torch.no_grad()
+def compute_jump_statistics(indices: torch.Tensor):
+    """
+    Compute jump-based statistics along the scan sequence.
+
+    Statistics:
+        f1: Mean absolute jump distance
+        f2: Jump variance
+        f3: Local continuity ratio (fraction of unit jumps)
+
+    Args:
+        indices (Tensor): 1D scan order indices, shape (L,).
+
+    Returns:
+        Tensor: Shape (3,), [f1, f2, f3]
+    """
+    d_index = (indices[1:] - indices[:-1]).abs().float()
+
+    mean_jump = d_index.mean()
+    jump_variance = d_index.var(unbiased=False)
+    continuity_ratio = (d_index == 1).float().mean()
+
+    return torch.stack([mean_jump, jump_variance, continuity_ratio])
+
+
+@torch.no_grad()
+def compute_spatial_step_statistics(indices: torch.Tensor, width: int):
+    """
+    Compute average Manhattan step length in spatial domain.
+
+    Statistics:
+        f4: Mean spatial Manhattan step
+
+    Args:
+        indices (Tensor): 1D scan order indices.
+        width (int): Image width.
+
+    Returns:
+        Tensor: Shape (1,), [f4]
+    """
+    row, col = indices_to_row_col(indices, width)
+
+    d_row = (row[1:] - row[:-1]).abs()
+    d_col = (col[1:] - col[:-1]).abs()
+
+    manhattan_step = (d_row + d_col).float()
+    mean_step = manhattan_step.mean()
+
+    return torch.tensor([mean_step], device=indices.device)
+
+
+@torch.no_grad()
+def compute_direction_statistics(indices: torch.Tensor, width: int):
+    """
+    Compute direction-related scan statistics.
+
+    Statistics:
+        f5: Directional consistency
+        f8: Order symmetry
+
+    Args:
+        indices (Tensor): 1D scan order indices.
+        width (int): Image width.
+
+    Returns:
+        Tensor: Shape (2,), [f5, f8]
+    """
+    device = indices.device
+    seq_len = indices.numel()
+
+    row, col = indices_to_row_col(indices, width)
+    d_row = row[1:] - row[:-1]
+    d_col = col[1:] - col[:-1]
+
+    # ---- Directional consistency ----
+    if d_row.numel() > 1:
+        sign_row = torch.sign(d_row)
+        sign_col = torch.sign(d_col)
+
+        same_direction = (
+            (sign_row[1:] == sign_row[:-1]) &
+            (sign_col[1:] == sign_col[:-1])
+        ).float()
+
+        directional_consistency = same_direction.mean()
+    else:
+        directional_consistency = torch.tensor(0.0, device=device)
+
+    # ---- Order symmetry ----
+    order_symmetry = (indices == (seq_len - 1 - indices.flip(0))).float().mean()
+
+    return torch.stack([directional_consistency, order_symmetry])
+
+
+@torch.no_grad()
+def compute_coverage_statistics(indices: torch.Tensor, height: int, width: int):
+    """
+    Compute spatial coverage and center bias statistics.
+
+    Statistics:
+        f6: Prefix coverage rate
+        f7: Center bias
+
+    Args:
+        indices (Tensor): 1D scan order indices.
+        height (int): Image height.
+        width (int): Image width.
+
+    Returns:
+        Tensor: Shape (2,), [f6, f7]
+    """
+    row, col = indices_to_row_col(indices, width)
+
+    # ---- Prefix coverage ----
+    row_seq = row.unsqueeze(0)
+    col_seq = col.unsqueeze(0)
+
+    min_row, _ = torch.cummin(row_seq, dim=1)
+    max_row, _ = torch.cummax(row_seq, dim=1)
+    min_col, _ = torch.cummin(col_seq, dim=1)
+    max_col, _ = torch.cummax(col_seq, dim=1)
+
+    coverage_radius = (max_row - min_row) + (max_col - min_col)
+    prefix_coverage = (coverage_radius / (height + width)).mean().squeeze()
+
+    # ---- Center bias ----
+    center_row = (height - 1) / 2.0
+    center_col = (width - 1) / 2.0
+
+    center_distance = (
+        (row.float() - center_row).abs() +
+        (col.float() - center_col).abs()
+    )
+
+    center_bias = (center_distance / (height + width)).mean()
+
+    return torch.stack([prefix_coverage, center_bias])
+
+
+@torch.no_grad()
+def compute_local_revisit_rate(indices: torch.Tensor, window: int = 8):
+    """
+    Compute local revisit frequency within a sliding temporal window.
+
+    Statistic:
+        f_A: Fraction of positions revisiting recently visited locations
+
+    Args:
+        indices (Tensor): 1D scan order indices.
+        window (int): Temporal window size.
+
+    Returns:
+        Tensor: Scalar revisit rate
+    """
+    seq_len = indices.numel()
+    if seq_len <= window:
+        return torch.tensor(0.0, device=indices.device)
+
+    revisit_count = 0
+    for t in range(window, seq_len):
+        if indices[t] in indices[t - window:t]:
+            revisit_count += 1
+
+    return torch.tensor(revisit_count / (seq_len - window), device=indices.device)
+
+
+@torch.no_grad()
+def compute_cross_row_jump_ratio(indices: torch.Tensor, width: int):
+    """
+    Compute ratio of jumps crossing more than one row.
+
+    Statistic:
+        f_B: Cross-row jump ratio
+
+    Args:
+        indices (Tensor): 1D scan order indices.
+        width (int): Image width.
+
+    Returns:
+        Tensor: Scalar ratio
+    """
+    row = indices // width
+    row_jump = (row[1:] - row[:-1]).abs()
+    return (row_jump > 1).float().mean()
+
+
+@torch.no_grad()
+def compute_direction_entropy(indices: torch.Tensor, height: int, width: int):
+    """
+    Compute entropy of spatial movement directions.
+
+    Statistic:
+        f_C: Normalized direction entropy (4-connected)
+
+    Args:
+        indices (Tensor): 1D scan order indices.
+        height (int): Image height (unused, kept for interface consistency).
+        width (int): Image width.
+
+    Returns:
+        Tensor: Scalar entropy value in [0, 1]
+    """
+    row = indices // width
+    col = indices % width
+
+    d_row = row[1:] - row[:-1]
+    d_col = col[1:] - col[:-1]
+
+    directions = []
+    for i in range(d_row.numel()):
+        if d_row[i] == 0 and d_col[i] == 1:
+            directions.append(0)  # right
+        elif d_row[i] == 0 and d_col[i] == -1:
+            directions.append(1)  # left
+        elif d_row[i] == 1 and d_col[i] == 0:
+            directions.append(2)  # down
+        elif d_row[i] == -1 and d_col[i] == 0:
+            directions.append(3)  # up
+
+    if len(directions) == 0:
+        return torch.tensor(0.0, device=indices.device)
+
+    dir_tensor = torch.tensor(directions, device=indices.device)
+    hist = torch.bincount(dir_tensor, minlength=4).float()
+    prob = hist / hist.sum()
+
+    entropy = -(prob * (prob + 1e-8).log()).sum()
+    return entropy / math.log(4)
+
+
+@torch.no_grad()
+def compute_temporal_reversal_rate(indices: torch.Tensor):
+    """
+    Compute frequency of temporal direction reversals.
+
+    Statistic:
+        f_D: Temporal reversal rate
+
+    Args:
+        indices (Tensor): 1D scan order indices.
+
+    Returns:
+        Tensor: Scalar reversal frequency
+    """
+    if indices.numel() < 3:
+        return torch.tensor(0.0, device=indices.device)
+
+    d1 = indices[1:] - indices[:-1]
+    reversal = (d1[1:] * d1[:-1] < 0).float()
+
+    return reversal.mean()
+
+
+@torch.no_grad()
+def compute_block_disruption_rate(indices: torch.Tensor, height: int, width: int, block_size: int = 4):
+    """
+    Compute frequency of crossing spatial block boundaries.
+
+    Statistic:
+        f_E: Block disruption rate
+
+    Args:
+        indices (Tensor): 1D scan order indices.
+        height (int): Image height.
+        width (int): Image width.
+        block_size (int): Spatial block size.
+
+    Returns:
+        Tensor: Scalar disruption rate
+    """
+    row = indices // width
+    col = indices % width
+
+    block_row = row // block_size
+    block_col = col // block_size
+
+    block_change = (
+        (block_row[1:] != block_row[:-1]) |
+        (block_col[1:] != block_col[:-1])
+    )
+
+    return block_change.float().mean()
+
+
+@torch.no_grad()
+def compute_scan_statistics(indices: torch.Tensor, height: int, width: int):
+    """
+    Aggregate all scan-order structural statistics.
+
+    Output order:
+        [f1, f2, f3, f4, f5, f6, f7, f8,
+         f_A, f_B, f_C, f_D, f_E]
+
+    Args:
+        indices (Tensor): 1D scan order indices.
+        height (int): Image height.
+        width (int): Image width.
+
+    Returns:
+        Tensor: 1D statistics vector
+    """
+    jump_stats = compute_jump_statistics(indices)                  # (3,)
+    step_stats = compute_spatial_step_statistics(indices, width)  # (1,)
+    dir_stats = compute_direction_statistics(indices, width)      # (2,)
+    cov_stats = compute_coverage_statistics(indices, height, width)  # (2,)
+
+    # revisit_stat = compute_local_revisit_rate(indices)
+    cross_row_stat = compute_cross_row_jump_ratio(indices, width)
+    # entropy_stat = compute_direction_entropy(indices, height, width)
+    reversal_stat = compute_temporal_reversal_rate(indices)
+    block_stat = compute_block_disruption_rate(indices, height, width)
+
+    return torch.cat([
+        jump_stats,
+        step_stats,
+        dir_stats[:1],
+        cov_stats,
+        dir_stats[1:],
+        # revisit_stat.unsqueeze(0),
+        cross_row_stat.unsqueeze(0),
+        # entropy_stat.unsqueeze(0),
+        reversal_stat.unsqueeze(0),
+        block_stat.unsqueeze(0)
+    ], dim=0)
+
+
+def plot_statistics(stats: torch.Tensor):
+    """Plot the radar chart for the given different statistics.
+
+    Args:
+        stats (torch.Tensor): the serialization index
+    """
+
+    labels = [
+        "Jump", "J-Var", "Cont", "Step",
+        "DirC", "Cover", "Center-bias", "Sym",
+        "Revisit", "Cross", "DirEnt", "Reverse", "Block"
+    ]
+
+    num_vars = len(labels)
+
+    angles = [n / float(num_vars) * 2 * math.pi for n in range(num_vars)]
+    angles += angles[:1]
+
+    fig = plt.figure()
+    ax = plt.axes(polar=True)
+
+    for i in range(stats.shape[0]):
+        values = stats[i].tolist()
+        values += values[:1]
+        ax.plot(angles, values, linewidth=2)
+        ax.fill(angles, values, alpha=0.1)
+
+    ax.set_thetagrids([a * 180 / math.pi for a in angles[:-1]], labels)
+    ax.set_title("Scan Structural Fingerprint (Radar Plot)")
+
+    filename = f"Scan_Structural_Fingerprint_radar_plot.png"
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300)
+    plt.close()
+    print(f"Saved {filename}")
+
+def rank_norm(stats):
+    ranks = stats.argsort(dim=0).argsort(dim=0)
+    return ranks.float() / (stats.shape[0] - 1)
+
+
 if __name__ == "__main__":
 
     H, W = 16, 16
@@ -533,4 +920,12 @@ if __name__ == "__main__":
         ("plot_hilbert", hilbert)
     ]
     # print(parallel_snake_horizontal)
-    plot_serializations(serializations, H, W)
+    # plot_serializations(serializations, H, W)
+
+    stats_list = []
+    for _, idx in serializations:
+        s1 = compute_scan_statistics(torch.tensor(idx), H, W)
+        stats_list.append(rank_norm(s1))
+
+    stats_all = torch.stack(stats_list, dim=0)
+    plot_statistics(stats_all)

@@ -46,27 +46,30 @@ class HSMM(BaseBackbone):
     }
 
     def __init__(self,
-                 img_size=224,
-                 in_channels=3,
-                 arch=None,
-                 patch_size=16,
-                 embed_dims=192,
-                 num_layers=20,
-                 num_convs_patch_embed=1,
-                 with_pos_embed=True,
-                 with_rope_pos_embed=False,
-                 out_indices=-1,
-                 drop_rate=0.,
-                 drop_path_rate=0.,
-                 norm_cfg=dict(type='LN', eps=1e-6),
-                 final_norm=True,
-                 interpolate_mode='bicubic',
-                 layer_cfgs=dict(),
-                 layers_with_dwconv=[],
-                 init_cfg=None,
-                 test_cfg=dict(),
-                 convert_syncbn=False,
-                 freeze_patch_embed=False,
+                img_size=224,
+                in_channels=3,
+                arch=None,
+                patch_size=16,
+                embed_dims=192,
+                num_layers=20,
+                num_convs_patch_embed=1,
+                with_pos_embed=True,
+                with_rope_pos_embed=False,
+                out_indices=-1,
+                drop_rate=0.,
+                drop_path_rate=0.,
+                norm_cfg=dict(type='LN', eps=1e-6),
+                final_norm=True,
+                interpolate_mode='bicubic',
+                layer_cfgs=dict(),
+                layers_with_dwconv=[],
+                init_cfg=None,
+                test_cfg=dict(),
+                convert_syncbn=False,
+                freeze_patch_embed=False,
+                use_conv_gate: bool = False,
+                use_noisy_gate: bool = True,
+                use_residual_connection: bool = True,
                  **kwargs):
         super(HSMM, self).__init__(init_cfg)
 
@@ -95,7 +98,6 @@ class HSMM(BaseBackbone):
         self.with_rope_pos_embed = with_rope_pos_embed # FIXME: BUG MAY EXIST!
         self.interpolate_mode = interpolate_mode
         self.freeze_patch_embed = freeze_patch_embed
-        _drop_path_rate = drop_path_rate
 
         self.patch_embed = ConvPatchEmbed(
             in_channels=in_channels,
@@ -108,7 +110,7 @@ class HSMM(BaseBackbone):
         # same as PlainMamba
         self.patch_resolution = self.patch_embed.init_out_size
         num_patches = self.patch_resolution[0] * self.patch_resolution[1]
-        if with_pos_embed:
+        if self.with_pos_embed:
             if self.with_rope_pos_embed:
                 self.pos_embed = RotaryEmbedding(dim=self.embed_dims)
             else:
@@ -128,8 +130,8 @@ class HSMM(BaseBackbone):
                 f'Invalid out_indices {index}'
         self.out_indices = out_indices
 
-        dpr = np.linspace(0, _drop_path_rate, self.num_layers)
-        self.drop_path_rate = _drop_path_rate
+        dpr = np.linspace(0, drop_path_rate, self.num_layers)
+        self.drop_path_rate = drop_path_rate
 
         self.layer_cfgs = _layer_cfgs
         self.layers = ModuleList()
@@ -140,7 +142,10 @@ class HSMM(BaseBackbone):
             _layer_cfg_i = layer_cfgs[i]
             _layer_cfg_i.update({
                 "embed_dims": self.embed_dims,
-                "drop_path_rate": dpr[i]
+                "drop_path_rate": dpr[i],
+                "use_conv_gate": use_conv_gate,
+                "use_noisy_gate": use_noisy_gate,
+                "use_residual_connection": use_residual_connection,
             })
             if i in self.layers_with_dwconv:
                 _layer_cfg_i.update({"with_dwconv": True})
@@ -172,6 +177,8 @@ class HSMM(BaseBackbone):
         self.gn64 = nn.GroupNorm(num_channels=64, num_groups=4)
         self.gn32 = nn.GroupNorm(num_channels=32, num_groups=2)
         self.gn16 = nn.GroupNorm(num_channels=16, num_groups=2)
+
+        self.use_noisy_gate = use_noisy_gate
 
     @property
     def norm1(self):
@@ -211,7 +218,10 @@ class HSMM(BaseBackbone):
         # outs_before = []
         outs = []
         for i, layer in enumerate(self.layers):
-            x = layer(x, hw_shape=patch_resolution)
+            if self.use_noisy_gate:
+                x, load_balance_loss = layer(x, hw_shape=patch_resolution)
+            else:
+                x = layer(x, hw_shape=patch_resolution)
             if i == len(self.layers) - 1 and self.final_norm:
                 x = self.norm1(x)
 
@@ -243,4 +253,6 @@ class HSMM(BaseBackbone):
                 else:
                     continue
 
+        if self.use_noisy_gate:
+            return outs, load_balance_loss
         return outs

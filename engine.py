@@ -20,8 +20,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         samples = data['image'].to(torch.device(args.device))
         targets = data['label'].to(torch.device(args.device))
 
-        output = model(samples)
-        loss_final = criterion(output, targets.float())
+        if args.use_noisy_gate:
+            output, load_balance_loss = model(samples)
+            loss_final = load_balance_loss + criterion(output, targets.float())
+        else:
+            output = model(samples)
+            loss_final = criterion(output, targets.float())
         cur_time = time.strftime('%Y_%m_%d_%H:%M:%S', time.localtime(time.time()))
 
         loss_final_str = '{:.4f}'.format(loss_final.item())

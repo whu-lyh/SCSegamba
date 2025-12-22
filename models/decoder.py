@@ -20,9 +20,14 @@ class Decoder(nn.Module):
         self.MFS = MFS(8)
 
     def forward(self, samples):
-        outs_SAVSS = self.backbone(samples)
-        out = self.MFS(outs_SAVSS)
-        return out
+        if self.args.use_noisy_gate:
+            outs_SAVSS, load_balance_loss = self.backbone(samples)
+            out = self.MFS(outs_SAVSS)
+            return out, load_balance_loss
+        else:
+            outs_SAVSS = self.backbone(samples)
+            out = self.MFS(outs_SAVSS)
+            return out
 
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1., dims=(-2, -1)):
@@ -65,7 +70,10 @@ def build(args):
                         out_indices=(0, 1, 2, 3),
                         drop_path_rate=0.2,
                         final_norm=True,
-                        convert_syncbn=True)
+                        convert_syncbn=True,
+                        use_conv_gate=args.use_conv_gate,
+                        use_noisy_gate=args.use_noisy_gate,
+                        use_residual_connection=args.use_residual_connection)
     else:
         raise NotImplementedError(f"Model mode {args.model_mode} is not implemented.")
 
