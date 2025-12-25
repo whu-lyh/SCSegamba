@@ -29,7 +29,7 @@ class HSMM(BaseBackbone):
             'embed_dims': 256,
             'num_layers': 4,
             'num_convs_patch_embed': 2,
-            'with_rope_pos_embed': False,
+            'with_rope_pos_embed': True,
             'layers_with_dwconv': [],
             'layer_cfgs': {
                 'use_rms_norm': False,
@@ -54,7 +54,7 @@ class HSMM(BaseBackbone):
                 num_layers=20,
                 num_convs_patch_embed=1,
                 with_pos_embed=True,
-                with_rope_pos_embed=False,
+                with_rope_pos_embed=True,
                 out_indices=-1,
                 drop_rate=0.,
                 drop_path_rate=0.,

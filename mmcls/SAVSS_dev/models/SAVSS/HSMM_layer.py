@@ -1055,7 +1055,6 @@ class S6_2D(nn.Module):
 
         # cause the y_scan's token order is consistent to the original order (position consistent one-by-one), we can directly sum them up
         y = y_scan * self.act(z) # sum 4 sequences([B, L, d_inner]) and * z([B, L, d_inner])
-        # y = y_scan * self.act(z) # sum 4 sequences([B, L, d_inner]) and * z([B, L, d_inner])
         out = self.out_proj(y)
         if self.init_layer_scale is not None:
             out = out * self.gamma
@@ -1201,6 +1200,20 @@ class SerializationExpert(nn.Module):
         order, inv_order = self.serialize(hw_shape)
         out = self.S6_block(x, hw_shape, order, inv_order)
         return out
+
+
+class SwapInput(nn.Module):
+    def __init__(self, dim: int, strategy_fn):
+        super().__init__()
+        self.mlp = FeedForward(dim=dim)
+        self.serialize = strategy_fn
+
+    def forward(self, x, hw_shape):
+        order, inv_order = self.serialize(hw_shape)
+        x = x[:, order, :]
+        x = self.mlp(x)
+        x = x[:, inv_order, :]
+        return x
 
 
 class SwitchMoE_HS_base(nn.Module):
@@ -1479,14 +1492,14 @@ class SwitchMoE_HS(nn.Module):
         # -------- Experts -----------
         serial = SerializationStrategies()
         strategies = [
-            # lambda hw_shape: serial.Parallel_snake_horizontal(hw_shape),
+            lambda hw_shape: serial.Parallel_snake_horizontal(hw_shape),
             lambda hw_shape: serial.Parallel_snake_horizontal2(hw_shape),
             lambda hw_shape: serial.Parallel_snake_vertical(hw_shape),
             lambda hw_shape: serial.Diagonal_snake_left(hw_shape),
             lambda hw_shape: serial.Diagonal_snake_right(hw_shape),
-            # lambda hw_shape: serial.zorder(hw_shape),
+            lambda hw_shape: serial.zorder(hw_shape),
             lambda hw_shape: serial.zigzag(hw_shape),
-            # lambda hw_shape: serial.hilbert(hw_shape),
+            lambda hw_shape: serial.hilbert(hw_shape),
         ]
         self.num_experts = len(strategies)
         assert (self.top_k <= self.num_experts)
@@ -1694,6 +1707,279 @@ class SwitchMoE_HS(nn.Module):
         return moe_output, balance_loss
 
 
+class SwitchMoE_HS_adaptor(nn.Module):
+    """
+    A module that implements the Switched Mixture of Experts (MoE) architecture. 
+
+    Args:
+        dim (int): The input dimension.
+        hidden_dim (int): The hidden dimension of the feedforward network.
+        output_dim (int): The output dimension.
+        num_experts (int): The number of experts in the MoE.
+        capacity_factor (float, optional): The capacity factor that controls the capacity of the MoE. Defaults to 1.0.
+        *args: Variable length argument list.
+        **kwargs: Arbitrary keyword arguments.
+
+    Attributes:
+        dim (int): The input dimension.
+        hidden_dim (int): The hidden dimension of the feedforward network.
+        output_dim (int): The output dimension.
+        num_experts (int): The number of experts in the MoE.
+        capacity_factor (float): The capacity factor that controls the capacity of the MoE.
+        experts (nn.ModuleList): The list of feedforward networks representing the experts.
+        gate (SwitchGate): The switch gate module.
+    """
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        mamba_cfg,
+        top_k: int = 1,
+        capacity_factor: float = 1.0,
+        use_conv_gate: bool = False,
+        use_noisy_gate: bool = True,
+        use_residual_connection: bool = True,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+
+        self.top_k = top_k
+        self.capacity_factor = capacity_factor
+        self.ssm = S6_2D(**mamba_cfg)
+
+        # -------- Experts -----------
+        serial = SerializationStrategies()
+        self.strategies = [
+            lambda hw_shape: serial.Parallel_snake_horizontal(hw_shape),
+            lambda hw_shape: serial.Parallel_snake_horizontal2(hw_shape),
+            lambda hw_shape: serial.Parallel_snake_vertical(hw_shape),
+            lambda hw_shape: serial.Diagonal_snake_left(hw_shape),
+            lambda hw_shape: serial.Diagonal_snake_right(hw_shape),
+            lambda hw_shape: serial.zorder(hw_shape),
+            lambda hw_shape: serial.zigzag(hw_shape),
+            lambda hw_shape: serial.hilbert(hw_shape),
+        ]
+        self.num_experts = len(self.strategies)
+        assert (self.top_k <= self.num_experts)
+
+        self.experts = nn.ModuleList()
+        for i, strat in enumerate(self.strategies):
+            expert = SwapInput(dim=self.dim, strategy_fn=strat)
+            self.experts.append(expert)
+
+        # -------- Gating -----------
+        self.use_conv_gate = use_conv_gate
+        self.use_noisy_gate = use_noisy_gate
+        if self.use_conv_gate:
+            self.gate = SwitchGate_Conv(
+                self.dim,
+                self.num_experts,
+                self.capacity_factor,
+            )
+        else:
+            # self.gate = SwitchGate(
+            #     self.dim,
+            #     self.num_experts,
+            #     self.capacity_factor,
+            # )
+            self.gate = nn.Linear(self.dim, self.num_experts)
+        self.gate_norm = nn.LayerNorm(self.num_experts)
+
+        self.noise = nn.Linear(self.dim, self.num_experts)
+        self.noise_norm = nn.LayerNorm(self.num_experts)
+        
+        self.softplus = nn.Softplus()
+        self.softmax = nn.Softmax(-1)
+
+        self.register_buffer("mean", torch.tensor([0.0]))
+        self.register_buffer("std", torch.tensor([1.0]))
+
+        self.use_residual_connection = use_residual_connection
+
+    def cv_squared(self, x):
+        """The squared coefficient of variation of a sample.
+        Useful as a loss to encourage a positive distribution to be more uniform.
+        Epsilons added for numerical stability.
+        Returns 0 for an empty Tensor.
+
+        Args:
+            x: a `Tensor`.
+        Returns:
+            a `Scalar`.
+        """
+        eps = 1e-10
+        # if only num_expert = 1
+        if x.shape[0] == 1:
+            return torch.tensor([0], device=x.device, dtype=x.dtype)
+        cv_sq = x.float().var() / (x.float().mean() ** 2 + eps)
+        return torch.clamp(cv_sq, max=1e6)
+
+    def _gates_to_load(self, gates):
+        """Compute the true load per expert, given the gates.
+        The load is the number of examples for which the corresponding gate is >0.
+
+        Args:
+            gates: a `Tensor` of shape [batch_size, n]
+        Returns:
+            a float32 `Tensor` of shape [n]
+        """
+        return (gates > 0).sum(0)
+
+    def _prob_in_top_k(self, clean_values, noisy_values, noise_stddev, noisy_top_values):
+        """Helper function to NoisyTopKGating. # TODO: dig into this
+        Computes the probability that value is in top k, given different random noise.
+        This gives us a way of backpropagating from a loss that balances the number
+        of times each expert is in the top k experts per example.
+        In the case of no noise, pass in None for noise_stddev, and the result will
+        not be differentiable.
+
+        Args:
+            clean_values: a `Tensor` of shape [batch_size, num_experts].
+            noisy_values: a `Tensor` of shape [batch_size, num_experts].  Equal to clean values plus
+            normally distributed noise with standard deviation noise_stddev.
+            noise_stddev: a `Tensor` of shape [batch_size, num_experts], or None
+            noisy_top_values: a `Tensor` of shape [batch_size, m].
+            "values" Output of tf.top_k(noisy_top_values, m).  m >= k+1
+        Returns:
+            a `Tensor` of shape [batch_size, n].
+        """
+        # print("noisy_top_values.shape: ", noisy_top_values.shape)
+        batch = clean_values.size(0)
+        m = noisy_top_values.size(-1)
+        top_values_flat = noisy_top_values.flatten()
+        # print("top_values_flat.shape: ", top_values_flat.shape)
+
+        threshold_positions_if_in = torch.arange(batch, device=clean_values.device) * m + self.top_k
+        # print("threshold_positions_if_in: ", threshold_positions_if_in)
+        # print("threshold_positions_if_in.shape: ", threshold_positions_if_in.shape)
+        threshold_if_in = torch.unsqueeze(torch.gather(top_values_flat, 0, threshold_positions_if_in), 1)
+        # print("threshold_if_in: ", threshold_if_in)
+        is_in = torch.gt(noisy_values, threshold_if_in)
+        # print("is_in: ", is_in)
+        threshold_positions_if_out = threshold_positions_if_in - 1
+        threshold_if_out = torch.unsqueeze(torch.gather(top_values_flat, 0, threshold_positions_if_out), 1)
+        # is each value currently in the top k.
+        normal = Normal(self.mean, self.std)
+
+        scaled_if_in = (clean_values - threshold_if_in) / (noise_stddev + 1e-8)
+        scaled_if_out = (clean_values - threshold_if_out) / (noise_stddev + 1e-8)
+
+        scaled_if_in = torch.clamp(scaled_if_in, min=-10.0, max=10.0)
+        scaled_if_out = torch.clamp(scaled_if_out, min=-10.0, max=10.0)
+
+        prob_if_in = normal.cdf(scaled_if_in)
+        prob_if_out = normal.cdf(scaled_if_out)
+
+        prob = torch.where(is_in, prob_if_in, prob_if_out)
+        return prob
+
+    def noisy_top_k_gating(self, x, train, noise_epsilon=1e-2):
+        """Noisy top-k gating.
+        See paper: Outrageously large neural networks: The sparsely-gated mixture-of-experts layer.
+
+        Args:
+            x: input Tensor with shape [batch_size, seq_len, feat_dim]
+            train: a boolean - we only add noise at training time.
+            noise_epsilon: a float
+        Returns:
+            gates: a Tensor with shape [batch_size, num_experts]
+            load: a Tensor with shape [num_experts]
+        """
+        clean_logits = self.gate_norm(self.gate(x.mean(1))) # get clean_logits shape [batch_size, seq_len, num_experts], if add mean(1), got shape [batch_size, num_experts]
+        if self.use_noisy_gate and train:
+            raw_noise_stddev = self.noise_norm(self.noise(x.mean(1)))
+            noise_stddev = (self.softplus(raw_noise_stddev) + noise_epsilon).clamp(max=1.0)
+            noisy_logits = clean_logits + torch.randn_like(clean_logits) * noise_stddev # get noisy_logits shape [batch_size, seq_len, num_experts], if add mean(1), got shape [batch_size, num_experts]
+            logits = noisy_logits
+        else:  
+            logits = clean_logits
+        # calculate topk + 1 that will be needed for the noisy gates, and why? # TODO
+        top_logits, top_indices = logits.topk(min(self.top_k + 1, self.num_experts), dim=-1) # both shape [batch_size, num_experts]
+        top_logits = top_logits - top_logits.max(dim=-1, keepdim=True).values
+        top_k_logits = top_logits[:, :self.top_k] # shape [batch_size, self.top_k]
+        top_k_indices = top_indices[:, :self.top_k] # shape [batch_size, self.top_k]
+        top_k_gates = self.softmax(top_k_logits)
+        # print("top_k_gates.shape: ", top_k_gates.shape)
+        # print("top_k_gates: ", top_k_gates)
+        # print("top_k_indices.shape: ", top_k_indices.shape)
+        # print("top_k_indices: ", top_k_indices)
+
+        zeros = torch.zeros_like(logits, requires_grad=True)
+        gates = zeros.scatter(1, top_k_indices, top_k_gates) # shape [batch_size, num_experts]
+        # print("gates.shape: ", gates.shape)
+        # print("gates: ", gates)
+
+        if self.use_noisy_gate and self.top_k < self.num_experts and train:
+            load = (self._prob_in_top_k(clean_logits, noisy_logits, noise_stddev, top_logits)).sum(0) # shape [num_experts]
+        else:
+            load = self._gates_to_load(gates) # shape [num_experts]
+        # print("load.shape: ", load.shape)
+        # print("load: ", load)
+        return gates, load
+
+    def forward(self, x, hw_shape, loss_coef=1e-2):
+        """
+        Args:
+            x: tensor shape [batch_size, seq_len, feat_dim]
+            train: a boolean scalar. Inside member forward, we can use self.training directly
+            loss_coef: a scalar - multiplier on load-balancing losses
+        Returns:
+            y: a tensor with shape [batch_size, seq_len, output_dim].
+            extra_training_loss: a scalar.  This should be added into the overall
+            training loss of the model.  The backpropagation of this loss
+            encourages all experts to be approximately equally used across a batch.
+        """
+        residual = x
+        gates, load = self.noisy_top_k_gating(x, self.training) # gate shape [batch_size, num_experts], load shape [num_experts]
+        # calculate importance loss
+        importance = gates.sum(0)
+        balance_loss = self.cv_squared(importance) + self.cv_squared(load)
+        balance_loss *= loss_coef
+        # print("Importance:", importance)
+        # print("Load:", load)
+        # print("balance_loss:", balance_loss)
+
+        # Dispatch to experts
+        expert_outputs = [expert(x, hw_shape) for expert in self.experts] # each element (batch_size, seq_len, output_dim)
+
+        # Check if any gate scores are nan and handle
+        if torch.isnan(gates).any():
+            print("NaN in gate scores")
+            gates[torch.isnan(gates)] = 0
+
+        # Stack and weight outputs
+        stacked_expert_outputs = torch.stack(expert_outputs, dim=-1) # (batch_size, seq_len, output_dim, num_experts)
+
+        # Check if any expert outputs are nan and handle
+        if torch.isnan(stacked_expert_outputs).any():
+            stacked_expert_outputs[torch.isnan(stacked_expert_outputs)] = 0
+
+        # Combine expert outputs and gating scores
+        output = torch.sum(gates.unsqueeze(1).unsqueeze(2) * stacked_expert_outputs, dim=-1) # (batch_size, seq_len, output_dim)
+        # Or the einsum operator, get the same result
+        # output = torch.einsum('blhn, bn->blh', stacked_expert_outputs, gates)
+
+        selected_idx = gates.argmax(dim=-1).long()
+        orders = []
+        inv_orders = []
+        for idx in range(selected_idx.size(0)):
+            order, inv_order = torch.tensor(self.strategies[selected_idx[idx]](hw_shape)).long()
+            orders.append(order)
+            inv_orders.append(inv_order)
+        orders = torch.stack(orders) # (batch_size, L)
+        inv_orders = torch.stack(inv_orders) # (batch_size, L)
+
+        ssms = self.ssm(x + output, hw_shape, orders, inv_orders)
+
+        if self.use_residual_connection:
+            output = ssms + residual
+
+        return output, balance_loss
+
+
 class SpatialRouter(nn.Module):
     def __init__(self, d_model, num_scans):
         super().__init__()
@@ -1706,6 +1992,21 @@ class SpatialRouter(nn.Module):
         feat = self.conv(x)
         feat = self.pool(feat).view(B, C)
         scan_weights = self.fc(feat) # (B, num_scans)
+        return F.gumbel_softmax(scan_weights, tau=1.0, hard=True)
+        # return torch.softmax(scan_weights, dim=-1)
+
+
+class MLPRouter(nn.Module):
+    def __init__(self, d_model, num_scans):
+        super().__init__()
+        self.MLP = FeedForward(dim=d_model)
+        self.fc = nn.Linear(d_model, num_scans)
+
+    def forward(self, x):
+        # BLC = x.shape
+        feat = self.MLP(x)
+        scan_weights = self.fc(feat) # (B, L, num_scans)
+        scan_weights = scan_weights.mean(dim=1) # (B, num_scans)
         return F.gumbel_softmax(scan_weights, tau=1.0, hard=True)
         # return torch.softmax(scan_weights, dim=-1)
 
@@ -1725,7 +2026,7 @@ class SASS(nn.Module):
         hidden_dim: int,
         output_dim: int,
         mamba_cfg,
-        use_conv_gate: bool = True,
+        use_conv_gate: bool = False,
         use_residual_connection: bool = True,
     ):
         super().__init__()
@@ -1746,37 +2047,14 @@ class SASS(nn.Module):
             lambda hw_shape: serial.zigzag(hw_shape),
             lambda hw_shape: serial.hilbert(hw_shape),
         ]
-        self.scan_serial_embedding = nn.Linear(11, self.in_dim)
 
         self.use_conv_gate = use_conv_gate
         if self.use_conv_gate:
             self.router = SpatialRouter(d_model=self.in_dim, num_scans=len(self.strategies))
         else:
-            self.router = nn.Sequential(FeedForward(dim=self.in_dim*2))
-        self.router_norm = nn.LayerNorm(self.in_dim)
+            self.router = MLPRouter(d_model=self.in_dim, num_scans=len(self.strategies))
 
         self.use_residual_connection = use_residual_connection
-
-    def forward1(self, x, hw_shape):
-        """
-        Args:
-            x: tensor shape [batch_size, seq_len, feat_dim]
-        Returns:
-            y: a tensor indicates the serialization strategy weights with shape [batch_size, in_dim].
-        """
-        residual = x
-        orders, inv_orders = [], []
-        stats = []
-        for i, strat in enumerate(self.strategies):
-            order, inv_order = strat(hw_shape)
-            x_stats = compute_scan_statistics(torch.tensor(order), hw_shape[0], hw_shape[1])
-            stats.append(x_stats)
-        stats = torch.stack(stats, dim=0).cuda() # [num_stats, stat_dim]
-        x_embed = self.scan_serial_embedding(stats) # # [num_stats, stat_dim] -> [num_stats, in_dim]
-        # TODO
-        if self.use_residual_connection:
-            out = out + residual
-        return out
 
     def forward(self, x, hw_shape):
         """
@@ -1786,9 +2064,10 @@ class SASS(nn.Module):
             y: a tensor indicates the serialization strategy weights with shape [batch_size, seq_len, feat_dim].
         """
         residual = x
-        B, L, C = x.shape
-        H = W = int(math.sqrt(L)) # only support square input for now
-        x = x.reshape(B, H, W, C).permute(0, 3, 1, 2)
+        if self.use_conv_gate:
+            B, L, C = x.shape
+            H = W = int(math.sqrt(L)) # only support square input for now
+            x = x.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
         gate = self.router(x)
         selected_idx = gate.argmax(dim=-1).long()
@@ -1801,7 +2080,9 @@ class SASS(nn.Module):
         orders = torch.stack(orders) # (batch_size, L)
         inv_orders = torch.stack(inv_orders) # (batch_size, L)
 
-        x = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
+        if self.use_conv_gate:
+            x = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
+
         out = self.ssm(x, hw_shape, orders, inv_orders)
 
         if self.use_residual_connection:
@@ -1818,7 +2099,7 @@ class HSMM_layer(nn.Module):
             drop_path_rate,
             mamba_cfg,
             use_conv_gate: bool = False,
-            use_noisy_gate: bool = False,
+            use_noisy_gate: bool = True,
             use_residual_connection: bool = True,
     ):
         super(HSMM_layer, self).__init__()
@@ -1848,15 +2129,20 @@ class HSMM_layer(nn.Module):
         # self.HSMM = S6_2D_HS(**mamba_cfg)
 
         # version1
-        self.HSMM = SASS(in_dim=embed_dims, hidden_dim=embed_dims, output_dim=embed_dims, 
-                         mamba_cfg=mamba_cfg, 
-                         use_residual_connection=use_residual_connection)
+        # self.HSMM = SASS(in_dim=embed_dims, hidden_dim=embed_dims, output_dim=embed_dims, 
+        #                  mamba_cfg=mamba_cfg, 
+        #                  use_residual_connection=use_residual_connection)
 
         # version2
         self.use_noisy_gate = use_noisy_gate
         # self.HSMM = SwitchMoE_HS(dim=embed_dims, hidden_dim=embed_dims, output_dim=embed_dims, 
         #                          mamba_cfg=mamba_cfg,
         #                          use_conv_gate=use_conv_gate, use_noisy_gate=use_noisy_gate, use_residual_connection=use_residual_connection)
+
+        # version3
+        self.HSMM = SwitchMoE_HS_adaptor(dim=embed_dims, hidden_dim=embed_dims, output_dim=embed_dims, 
+                                 mamba_cfg=mamba_cfg,
+                                 use_conv_gate=use_conv_gate, use_noisy_gate=use_noisy_gate, use_residual_connection=use_residual_connection)
 
         self.drop_path = build_dropout(dict(type='DropPath', drop_prob=drop_path_rate))
         self.linear_256 = nn.Linear(in_features=256, out_features=256, bias=True)
@@ -1882,12 +2168,14 @@ class HSMM_layer(nn.Module):
         # mixed_x = self.drop_path(self.HSMM(self.norm(x), hw_shape, orders, inverse_orders))
 
         # version1: get serialization first based on gate alone, return top-1 serialization results
-        mixed_x = self.drop_path(self.HSMM(self.norm(x), hw_shape))
+        # mixed_x = self.drop_path(self.HSMM(self.norm(x), hw_shape))
 
         load_balance_loss = None
         # version2: inject SSM into experts, x shape conversion is set inside HSMM
-        # (mixed_x, load_balance_loss) = self.HSMM(self.norm(x), hw_shape)
-        # mixed_x = self.drop_path(mixed_x)
+        # version3: set an adaptor for each scanning strategies and set as experts then add with original x before fed into SSM
+        # NOTE that version2 and version3 share the same HSMM class call manner
+        (mixed_x, load_balance_loss) = self.HSMM(self.norm(x), hw_shape)
+        mixed_x = self.drop_path(mixed_x)
 
         b, l, c = mixed_x.shape
         h = w = int(math.sqrt(l))

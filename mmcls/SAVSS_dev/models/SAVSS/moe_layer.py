@@ -67,7 +67,7 @@ class SwitchGate(nn.Module):
         self.num_experts = num_experts
         self.capacity_factor = capacity_factor
         self.epsilon = epsilon
-        self.w_gate = nn.Linear(dim, num_experts)
+        self.gate = nn.Linear(dim, num_experts)
         self.pooling = nn.AdaptiveAvgPool2d(1)
         # self.conv_pooling = nn.Conv2d(C, out_dim, kernel_size=1) # TODO
 
@@ -83,7 +83,7 @@ class SwitchGate(nn.Module):
         """
         # Compute gate scores
         x = self.pooling(x).flatten(1)
-        gate_scores = F.softmax(self.w_gate(x), dim=-1)
+        gate_scores = F.softmax(self.gate(x), dim=-1)
 
         # Determine the top-1 expert for each token
         capacity = int(self.capacity_factor * x.size(0))
@@ -238,7 +238,7 @@ class SwitchGate_Conv(nn.Module):
         self.num_experts = num_experts
         self.capacity_factor = capacity_factor
         self.epsilon = epsilon
-        self.w_gate = nn.Sequential(
+        self.gate = nn.Sequential(
             BottConv(dim, num_experts, dim // 8, kernel_size=3, stride=1, padding=1),
             nn.AdaptiveAvgPool2d(1)
         )
@@ -254,7 +254,7 @@ class SwitchGate_Conv(nn.Module):
             Tensor: Gate scores. shape should be [B, num_experts]
         """
         # Compute gate scores, flatten the last two dimensions
-        gate_scores = F.softmax(torch.flatten(self.w_gate(x), 1), dim=-1)
+        gate_scores = F.softmax(torch.flatten(self.gate(x), 1), dim=-1)
 
         # Determine the top-1 expert for each token
         capacity = int(self.capacity_factor * x.size(0))
@@ -284,103 +284,6 @@ class SwitchGate_Conv(nn.Module):
 
         return gate_scores, None
 
-
-class SwitchMoE_HS(nn.Module):
-    """
-    A module that implements the Switched Mixture of Experts (MoE) architecture. 
-    Directlly replace the feedforward layer in transformer block with this MoE layer.
-
-    Args:
-        dim (int): The input dimension.
-        hidden_dim (int): The hidden dimension of the feedforward network.
-        output_dim (int): The output dimension.
-        num_experts (int): The number of experts in the MoE.
-        capacity_factor (float, optional): The capacity factor that controls the capacity of the MoE. Defaults to 1.0.
-        mult (int, optional): The multiplier for the hidden dimension of the feedforward network. Defaults to 4.
-        *args: Variable length argument list.
-        **kwargs: Arbitrary keyword arguments.
-
-    Attributes:
-        dim (int): The input dimension.
-        hidden_dim (int): The hidden dimension of the feedforward network.
-        output_dim (int): The output dimension.
-        num_experts (int): The number of experts in the MoE.
-        capacity_factor (float): The capacity factor that controls the capacity of the MoE.
-        mult (int): The multiplier for the hidden dimension of the feedforward network.
-        experts (nn.ModuleList): The list of feedforward networks representing the experts.
-        gate (SwitchGate): The switch gate module.
-
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        hidden_dim: int,
-        output_dim: int,
-        num_experts: int,
-        capacity_factor: float = 1.0,
-        mult: int = 4,
-        use_aux_loss: bool = False,
-        *args,
-        **kwargs,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.num_experts = num_experts
-        self.capacity_factor = capacity_factor
-        self.mult = mult
-        self.use_aux_loss = use_aux_loss
-
-        self.experts = nn.ModuleList(
-            [
-                FeedForward(dim, dim, mult, *args, **kwargs)
-                for _ in range(num_experts)
-            ]
-        )
-
-        self.gate = SwitchGate_Conv(
-            dim,
-            num_experts,
-            capacity_factor,
-        )
-
-    def forward(self, x: Tensor):
-        """
-        Forward pass of the SwitchMoE_HS module.
-
-        Args:
-            x (Tensor): The input tensor.
-
-        Returns:
-            Tensor: The output tensor of the MoE.
-
-        """
-        # (batch_size, seq_len, num_experts)
-        gate_scores, loss = self.gate(x, use_aux_loss=self.use_aux_loss)
-
-        # Dispatch to experts
-        expert_outputs = [expert(x) for expert in self.experts]
-
-        # Check if any gate scores are nan and handle
-        if torch.isnan(gate_scores).any():
-            print("NaN in gate scores")
-            gate_scores[torch.isnan(gate_scores)] = 0
-
-        # Stack and weight outputs
-        stacked_expert_outputs = torch.stack(
-            expert_outputs, dim=-1
-        )  # (batch_size, seq_len, output_dim, num_experts)
-        if torch.isnan(stacked_expert_outputs).any():
-            stacked_expert_outputs[torch.isnan(stacked_expert_outputs)] = 0
-
-        # Combine expert outputs and gating scores
-        moe_output = torch.sum(
-            gate_scores.unsqueeze(-2) * stacked_expert_outputs, dim=-1
-        )
-
-        return moe_output, loss
 
 
 if __name__ == "__main__":
