@@ -241,8 +241,7 @@ class SAVSS_2D(nn.Module):
                 x_conv[:, o, :].permute(0, 2, 1).contiguous(), # the input sequence should be BDL
                 dt, # selective factor
                 A,
-                # (B + dB).contiguous(), # dB operation is inherited from PlainMamba, which is the direction-aware update module for x
-                B, # original mamba update manner
+                (B + dB).contiguous(), # dB operation is inherited from PlainMamba, which is the direction-aware update module for x
                 C,
                 self.D.float(),
                 z=None,

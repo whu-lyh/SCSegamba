@@ -34,7 +34,6 @@ class SAVSS(BaseBackbone):
             'embed_dims': 256,
             'num_layers': 4,
             'num_convs_patch_embed': 2,
-            'with_rope_pos_embed': False,
             'layers_with_dwconv': [],
             'layer_cfgs': {
                 'use_rms_norm': False,
@@ -60,7 +59,6 @@ class SAVSS(BaseBackbone):
                  num_layers=20,
                  num_convs_patch_embed=1,
                  with_pos_embed=True,
-                 with_rope_pos_embed=False,
                  out_indices=-1,
                  drop_rate=0.,
                  drop_path_rate=0.,
@@ -98,7 +96,6 @@ class SAVSS(BaseBackbone):
             _layer_cfgs = self.arch_zoo[self.arch]['layer_cfgs']
 
         self.with_pos_embed = with_pos_embed
-        self.with_rope_pos_embed = with_rope_pos_embed # FIXME: BUG MAY EXIST!
         self.interpolate_mode = interpolate_mode
         self.freeze_patch_embed = freeze_patch_embed
         _drop_path_rate = drop_path_rate
@@ -115,11 +112,8 @@ class SAVSS(BaseBackbone):
         self.patch_resolution = self.patch_embed.init_out_size
         num_patches = self.patch_resolution[0] * self.patch_resolution[1]
         if with_pos_embed:
-            if self.with_rope_pos_embed:
-                self.pos_embed = RotaryEmbedding(dim=self.embed_dims)
-            else:
-                self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, self.embed_dims))
-                trunc_normal_(self.pos_embed, std=0.02)
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, self.embed_dims))
+            trunc_normal_(self.pos_embed, std=0.02)
         self.drop_after_pos = nn.Dropout(p=drop_rate)
 
         if isinstance(out_indices, int):
@@ -188,8 +182,7 @@ class SAVSS(BaseBackbone):
         if not (isinstance(self.init_cfg, dict)
                 and self.init_cfg['type'] == 'Pretrained'): # actually no pretrained weights available
             if self.with_pos_embed:
-                if not self.with_rope_pos_embed:
-                    trunc_normal_(self.pos_embed, std=0.02)
+                trunc_normal_(self.pos_embed, std=0.02)
         self.set_freeze_patch_embed()
 
     def set_freeze_patch_embed(self):
@@ -201,17 +194,14 @@ class SAVSS(BaseBackbone):
     def forward(self, x):
         x, patch_resolution = self.patch_embed(x)
         if self.with_pos_embed:
-            if self.with_rope_pos_embed:
-                x = self.pos_embed.rotate_queries_or_keys(x)
-            else:
-                pos_embed = resize_pos_embed(
-                    self.pos_embed,
-                    self.patch_resolution,
-                    patch_resolution,
-                    mode=self.interpolate_mode,
-                    num_extra_tokens=0
-                )
-                x = x + pos_embed
+            pos_embed = resize_pos_embed(
+                self.pos_embed,
+                self.patch_resolution,
+                patch_resolution,
+                mode=self.interpolate_mode,
+                num_extra_tokens=0
+            )
+            x = x + pos_embed
         x = self.drop_after_pos(x)
 
         # outs_before = []
